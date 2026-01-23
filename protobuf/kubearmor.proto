@@ -156,3 +156,37 @@ service LogService {
   rpc WatchAlerts(RequestMessage) returns (stream Alert);
   rpc WatchLogs(RequestMessage) returns (stream Log);
 }
+
+// API Observability structs and service
+
+// APIEvent represents a captured HTTP/gRPC API call
+message APIEvent {
+  int64 timestamp = 1;
+  string source_pod = 2;
+  string source_namespace = 3;
+  string source_container = 4;
+  string dest_ip = 5;
+  uint32 dest_port = 6;
+  string method = 7;          // HTTP method or gRPC method
+  string path = 8;            // HTTP path or gRPC service/method
+  int32 status_code = 9;      // HTTP status or gRPC status
+  map<string, string> headers = 10;
+  bytes request_body = 11;
+  bytes response_body = 12;
+  string protocol = 13;       // "HTTP" or "gRPC"
+  uint64 socket_ptr = 14;     // For correlation
+  string cluster_name = 15;
+  string host_name = 16;
+}
+
+// ClientInfo for API observer clients
+message ClientInfo {
+  string host_name = 1;
+  string ip_address = 2;
+}
+
+// APIObserver service for streaming API events
+service APIObserver {
+  rpc GetAPIEvent(ClientInfo) returns (stream APIEvent);
+}
+

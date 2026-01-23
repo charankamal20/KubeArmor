@@ -77,6 +77,8 @@ type KubearmorConfig struct {
 	USBDeviceHandler bool // enable USB device observability and enforcement
 
 	MatchArgs bool // enable argument rules for policy
+
+	ConfigApiObservability bool // enable api observability
 }
 
 // GlobalCfg Global configuration for Kubearmor
@@ -133,6 +135,7 @@ const (
 	ConfigEnableIma                      string = "enableIMA"
 	ConfigUSBDeviceHandler               string = "enableUSBDeviceHandler"
 	ConfigArgMatching                    string = "matchArgs"
+	ConfigApiObservability               string = "observerApi"
 )
 
 func readCmdLineParams() {
@@ -205,6 +208,8 @@ func readCmdLineParams() {
 	dropResourceFromProcessLogs := flag.Bool(ConfigDropResourceFromProcessLogs, false, "drop resource field from process logs")
 
 	matchArgs := flag.Bool(ConfigArgMatching, true, "enabling Argument matching")
+
+	enableApiObservability := flag.Bool(ConfigApiObservability, false, "enable API Observability")
 
 	flags := []string{}
 	flag.VisitAll(func(f *flag.Flag) {
@@ -285,6 +290,8 @@ func readCmdLineParams() {
 	viper.SetDefault(ConfigDropResourceFromProcessLogs, *dropResourceFromProcessLogs)
 
 	viper.SetDefault(ConfigArgMatching, *matchArgs)
+
+	viper.SetDefault(ConfigApiObservability, *enableApiObservability)
 }
 
 // LoadConfig Load configuration
@@ -376,6 +383,8 @@ func LoadConfig() error {
 	GlobalCfg.DropResourceFromProcessLogs = viper.GetBool(ConfigDropResourceFromProcessLogs)
 
 	GlobalCfg.MatchArgs = viper.GetBool(ConfigArgMatching)
+
+	GlobalCfg.ConfigApiObservability = viper.GetBool(ConfigApiObservability)
 
 	LoadDynamicConfig()
 

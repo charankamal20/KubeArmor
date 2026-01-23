@@ -1,7 +1,7 @@
 include Makefile.vars
 
 .PHONY: all
-all: kernel_headers libbpf system_monitor.bpf.o
+all: kernel_headers libbpf system_monitor.bpf.o http_tracer.bpf.o
 
 .PHONY: kernel_headers
 kernel_headers:
@@ -37,6 +37,10 @@ endif
 # Ref https://elixir.bootlin.com/linux/v5.19.5/source/samples/bpf/Makefile#L439
 
 system_monitor.bpf.o: $(SYSMONITOR) $(VMLINUX_H)
+	@echo "Compiling eBPF bytecode: $(GREEN)$@$(NC) ..."
+	$(Q)$(CL) $(KF) -Xclang -disable-llvm-passes -c $< -o - | opt -O2 -mtriple=bpf-pc-linux | llvm-dis | llc -march=bpf -mcpu=probe -filetype=obj -o $@
+
+http_tracer.bpf.o: http_tracer.bpf.c $(VMLINUX_H)
 	@echo "Compiling eBPF bytecode: $(GREEN)$@$(NC) ..."
 	$(Q)$(CL) $(KF) -Xclang -disable-llvm-passes -c $< -o - | opt -O2 -mtriple=bpf-pc-linux | llvm-dis | llc -march=bpf -mcpu=probe -filetype=obj -o $@
 

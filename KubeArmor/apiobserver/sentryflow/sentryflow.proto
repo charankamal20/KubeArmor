@@ -1,0 +1,127 @@
+syntax = "proto3";
+
+package protobuf;
+
+option go_package = "github.com/accuknox/SentryFlow/protobuf/golang";
+
+message ClientInfo {
+  string hostName = 1;
+  string IPAddress = 2;
+}
+
+message APILog {
+  option deprecated = true;
+
+  uint64 id = 1;
+  string timeStamp = 2;
+
+  string srcNamespace = 11;
+  string srcName = 12;
+  map<string, string> srcLabel = 13;
+
+  string srcType = 21;
+  string srcIP = 22;
+  string srcPort = 23;
+
+  string dstNamespace = 31;
+  string dstName = 32;
+  map<string, string> dstLabel = 33;
+
+  string dstType = 41;
+  string dstIP = 42;
+  string dstPort = 43;
+
+  string protocol = 51;
+  string method = 52;
+  string path = 53;
+  int32 responseCode = 54;
+}
+
+// APIEvent represents an event related to an API call, including metadata,
+// source and destination workloads, and network information.
+message APIEvent {
+  Metadata metadata = 1;
+  Workload source = 3;
+  Workload destination = 4;
+  Request request = 5;
+  Response response = 6;
+  string protocol = 7;
+}
+
+message Metadata {
+  uint32 context_id = 1;
+  uint64 timestamp = 2;
+  string istio_version = 3 [deprecated = true];
+  string mesh_id = 4;
+
+  // The name of the Kubernetes node where the workload is running. If the workload
+  // is not running in a Kubernetes environment, this field will be empty.
+  string node_name = 5;
+
+  // Name of receiver (e.g., Istio, nginx).
+  string receiver_name = 6;
+  // Version of receiver (e.g., 1.26.2).
+  string receiver_version = 7;
+}
+
+// Workload represents a generic entity that can be either a Kubernetes or
+// non-Kubernetes resource. It serves as a source or destination for access
+// within a system.
+message Workload {
+  // The name of the workload.
+  string name = 1;
+
+  // The namespace in which the workload is deployed. This field is only applicable
+  // for Kubernetes workloads.
+  string namespace = 2;
+
+  // The IP address of the workload.
+  string ip = 3;
+
+  // The port number used by the workload.
+  int32 port = 4;
+}
+
+// Request represents an incoming HTTP request.
+message Request {
+  map<string, string> headers = 1;
+  string body = 2;
+}
+
+// Response represents an outgoing HTTP response.
+message Response {
+  map<string, string> headers = 1;
+  string body = 2;
+  uint64 backend_latency_in_nanos = 3;
+}
+
+message APIMetrics {
+  map<string, uint64> perAPICounts = 1;
+  // @todo: add some more metrics here
+}
+
+message MetricValue {
+  map<string, string> value = 1;
+}
+
+message EnvoyMetrics {
+  string timeStamp = 1;
+
+  string namespace = 11;
+  string name = 12;
+  string IPAddress = 13;
+  map<string, string> labels = 14;
+
+  map<string, MetricValue> metrics = 21;
+}
+
+service SentryFlow {
+  rpc GetAPILog(ClientInfo) returns (stream APILog) {
+    option deprecated = true;
+  }
+  rpc GetAPIEvent(ClientInfo) returns (stream APIEvent);
+  rpc SendAPIEvent(APIEvent) returns(APIEvent);
+  rpc GetAPIMetrics(ClientInfo) returns (stream APIMetrics);
+  rpc GetEnvoyMetrics(ClientInfo) returns (stream EnvoyMetrics);
+}
+

@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kubearmor/KubeArmor/KubeArmor/apiobserver"
 	"github.com/kubearmor/KubeArmor/KubeArmor/common"
 	kl "github.com/kubearmor/KubeArmor/KubeArmor/common"
 	cfg "github.com/kubearmor/KubeArmor/KubeArmor/config"
@@ -120,6 +121,9 @@ type KubeArmorDaemon struct {
 
 	// USB device handler
 	USBDeviceHandler *dvc.USBDeviceHandler
+
+	// API observer
+	APIObserver *apiobserver.APIObserver
 }
 
 // NewKubeArmorDaemon Function
@@ -202,6 +206,15 @@ func (dm *KubeArmorDaemon) DestroyKubeArmorDaemon() {
 		//close USB device handler
 		if dm.CloseUSBDeviceHandler() {
 			dm.Logger.Print("Stopped USB Device Handler")
+		}
+	}
+
+	if dm.APIObserver != nil {
+		// close API observer
+		if err := dm.CloseAPIObserver(); err != nil {
+			dm.Logger.Errf("Failed to stop API Observer: %s", err.Error())
+		} else {
+			dm.Logger.Print("Stopped API Observer")
 		}
 	}
 
@@ -352,6 +365,32 @@ func (dm *KubeArmorDaemon) CloseUSBDeviceHandler() bool {
 		return false
 	}
 	return true
+}
+
+// ==================== //
+// == API Observer == //
+// ==================== //
+
+// InitAPIObserver Function
+func (dm *KubeArmorDaemon) InitAPIObserver() error {
+	dm.APIObserver = apiobserver.NewAPIObserver(dm.Logger, cfg.GlobalCfg.Cluster, dm.Node.NodeName)
+	if dm.APIObserver == nil {
+		return fmt.Errorf("failed to create API observer")
+	}
+
+	if err := dm.APIObserver.Start(); err != nil {
+		return fmt.Errorf("failed to start API observer: %w", err)
+	}
+
+	return nil
+}
+
+// CloseAPIObserver Function
+func (dm *KubeArmorDaemon) CloseAPIObserver() error {
+	if err := dm.APIObserver.Stop(); err != nil {
+		return fmt.Errorf("failed to stop API observer: %w", err)
+	}
+	return nil
 }
 
 // ============= //
@@ -855,6 +894,23 @@ func KubeArmor() {
 			return
 		}
 		dm.Logger.Print("Initialized KubeArmor USB Device Handler")
+	}
+
+	// == //
+
+	// Init API Observer
+	if cfg.GlobalCfg.ConfigApiObservability {
+		if err := dm.InitAPIObserver(); err != nil {
+			dm.Logger.Warnf("Failed to initialize API Observer: %v", err)
+			// Don't fail startup, just log warning
+		} else {
+			dm.Logger.Print("Initialized API Observer")
+
+			// Register gRPC service
+			exporter := apiobserver.NewAPIEventExporter(dm.APIObserver.GetEventChannel())
+			pb.RegisterAPIObserverServer(dm.Logger.LogServer, exporter)
+			dm.Logger.Print("Registered API Observer gRPC service")
+		}
 	}
 
 	// == //
