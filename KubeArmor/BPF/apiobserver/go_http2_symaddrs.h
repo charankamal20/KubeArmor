@@ -45,7 +45,8 @@ enum go_offset_kind {
   /* stream.st pointer (pre-v1.69) */
   GO_OFF_GRPC_STREAM_ST = 15,
 
-  GO_OFF_MAX,
+  GO_OFF_TLS_CONN_CONN = 16, 
+  GO_OFF_MAX = 17,
 };
 
 #define GO_OFFSET_TABLE_SIZE GO_OFF_MAX
