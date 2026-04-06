@@ -95,47 +95,10 @@ struct {
   __type(value, struct ssl_read_args);
 } active_ssl_read_args SEC(".maps");
 
-// In-flight SSL_write calls: pid_tgid -> ssl_write_args
+// OpenSSL struct field offsets — written once by userspace at startup
 struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 65536);
-  __type(key, u64);
-  __type(value, struct ssl_write_args);
-} active_ssl_write_args SEC(".maps");
-
-// Nested syscall FD tracking: pid_tgid -> nested_syscall_fd_t
-// Set by SSL_read/SSL_write entry probes (nested syscall FD access path).
-// Updated by syscall kprobes (read/write) that detect they are inside an SSL call.
-// Consumed by SSL_read/SSL_write return probes to extract the connection FD.
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 65536);
-  __type(key, u64);
-  __type(value, struct nested_syscall_fd_t);
-} ssl_user_space_call_map SEC(".maps");
-
-// Go TLS syscall suppression: pid_tgid -> u8 (1)
-//
-// While Go crypto/tls.(*Conn).Read/Write is executing, the Go runtime will
-// often perform nested syscalls (read/write/sendmsg/recvmsg) that carry
-// encrypted TLS records. We suppress those syscalls so userspace only sees
-// the decrypted plaintext emitted by the Go TLS uprobes (FLAG_IS_SSL).
-//
-// This mirrors the early-suppression window used for OpenSSL via
-// ssl_user_space_call_map, but does not require FD propagation.
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 65536);
-  __type(key, u64);   /* pid_tgid */
-  __type(value, u8);  /* active flag */
-} go_tls_user_space_call_map SEC(".maps");
-
-// OpenSSL struct field offsets — keyed by TGID (per-process).
-// Written by userspace at probe attach time for each discovered libssl.
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 4096);
+  __uint(type, BPF_MAP_TYPE_ARRAY);
+  __uint(max_entries, 1);
   __type(key, u32);
   __type(value, struct ssl_symaddrs);
 } ssl_symaddrs SEC(".maps");
-

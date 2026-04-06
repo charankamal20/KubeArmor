@@ -26,30 +26,16 @@
 /* ---- Constants ---- */
 #define GRPC_MAX_PATH_SIZE 160
 
-/* ---- Go register ABI parameter access (Go 1.17+) ----
- * x86_64: params in rax, rbx, rcx, rdi, rsi, r8; goroutine in r14
- * arm64:  params in R0-R5 (regs[0]-regs[5]); goroutine in R28 (regs[28])
- * See Pixie's go_trace_common.h go_regabi_regs() for reference.
- */
-#if defined(__TARGET_ARCH_x86)
-  #define GO_PARAM1(ctx)     ((void *)(ctx)->ax)
-  #define GO_PARAM2(ctx)     ((void *)(ctx)->bx)
-  #define GO_PARAM3(ctx)     ((void *)(ctx)->cx)
-  #define GO_PARAM4(ctx)     ((void *)(ctx)->di)
-  #define GO_PARAM5(ctx)     ((void *)(ctx)->si)
-  #define GO_PARAM6(ctx)     ((void *)(ctx)->r8)
-  #define GOROUTINE_PTR(ctx) ((void *)(ctx)->r14)
-#elif defined(__TARGET_ARCH_arm64)
-  #define GO_PARAM1(ctx)     ((void *)(ctx)->regs[0])
-  #define GO_PARAM2(ctx)     ((void *)(ctx)->regs[1])
-  #define GO_PARAM3(ctx)     ((void *)(ctx)->regs[2])
-  #define GO_PARAM4(ctx)     ((void *)(ctx)->regs[3])
-  #define GO_PARAM5(ctx)     ((void *)(ctx)->regs[4])
-  #define GO_PARAM6(ctx)     ((void *)(ctx)->regs[5])
-  #define GOROUTINE_PTR(ctx) ((void *)(ctx)->regs[28])
-#else
-  #error "Unsupported architecture: define __TARGET_ARCH_x86 or __TARGET_ARCH_arm64"
-#endif
+/* ---- Go register ABI parameter access (Go 1.17+ amd64) ---- */
+#define GO_PARAM1(ctx) ((void *)(ctx)->ax)
+#define GO_PARAM2(ctx) ((void *)(ctx)->bx)
+#define GO_PARAM3(ctx) ((void *)(ctx)->cx)
+#define GO_PARAM4(ctx) ((void *)(ctx)->di)
+#define GO_PARAM5(ctx) ((void *)(ctx)->si)
+#define GO_PARAM6(ctx) ((void *)(ctx)->r8)
+
+/* Goroutine pointer: Go stores the current goroutine in r14 (amd64). */
+#define GOROUTINE_PTR(ctx) ((void *)(ctx)->r14)
 
 /* ---- Event type emitted to userspace ---- */
 enum go_grpc_event_type {
@@ -244,14 +230,11 @@ int ka_uprobe_server_handleStream(struct pt_regs *ctx) {
 }
 
 /*
- * uprobe (ret-inst): grpc.(*Server).handleStream
+ * uretprobe: grpc.(*Server).handleStream
  * Return point. Reads Stream.Method (= gRPC path) and computes latency.
- *
- * NOTE: Go uretprobes can crash the runtime ("unexpected return pc").
- * Attach this as an uprobe at all RET instruction offsets (Pixie kReturnInsts model).
  */
-SEC("uprobe/server_handleStream_retinst")
-int ka_uprobe_server_handleStream_retinst(struct pt_regs *ctx) {
+SEC("uretprobe/server_handleStream")
+int ka_uretprobe_server_handleStream(struct pt_regs *ctx) {
   void *goroutine_addr = GOROUTINE_PTR(ctx);
   struct go_addr_key g_key = {};
   go_addr_key_init(&g_key, goroutine_addr);
@@ -387,13 +370,11 @@ int ka_uprobe_ClientConn_Invoke(struct pt_regs *ctx) {
 }
 
 /*
- * uprobe (ret-inst): grpc.(*ClientConn).Invoke
+ * uretprobe: grpc.(*ClientConn).Invoke
  * Return from unary client call. Emits event with method and latency.
- *
- * Attach at all RET instruction offsets (Pixie kReturnInsts model).
  */
-SEC("uprobe/ClientConn_Invoke_retinst")
-int ka_uprobe_ClientConn_Invoke_retinst(struct pt_regs *ctx) {
+SEC("uretprobe/ClientConn_Invoke")
+int ka_uretprobe_ClientConn_Invoke(struct pt_regs *ctx) {
   void *goroutine_addr = GOROUTINE_PTR(ctx);
   struct go_addr_key g_key = {};
   go_addr_key_init(&g_key, goroutine_addr);
@@ -466,13 +447,11 @@ int ka_uprobe_ClientConn_NewStream(struct pt_regs *ctx) {
 }
 
 /*
- * uprobe (ret-inst): grpc.(*clientStream).RecvMsg
+ * uretprobe: grpc.(*clientStream).RecvMsg
  * Completes a streaming client call. Same emission logic as Invoke return.
- *
- * Attach at all RET instruction offsets (Pixie kReturnInsts model).
  */
-SEC("uprobe/clientStream_RecvMsg_retinst")
-int ka_uprobe_clientStream_RecvMsg_retinst(struct pt_regs *ctx) {
+SEC("uretprobe/clientStream_RecvMsg")
+int ka_uretprobe_clientStream_RecvMsg(struct pt_regs *ctx) {
   void *goroutine_addr = GOROUTINE_PTR(ctx);
   struct go_addr_key g_key = {};
   go_addr_key_init(&g_key, goroutine_addr);

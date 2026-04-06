@@ -68,7 +68,6 @@
 
 #define MIN_HTTP_SIZE 16
 #define FLAG_IS_SSL 0x04 // event came from SSL uprobe
-#define INVALID_FD -1    // sentinel for "FD not yet captured"
 
 // Safe LE word read from BPF stack/percpu memory
 // buf MUST be in BPF memory

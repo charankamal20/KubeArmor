@@ -68,32 +68,14 @@ struct data_args {
   u64 buf; /* user buffer pointer (void * stored as u64) */
 };
 
-// ssl_read_args — saved on SSL_read/SSL_read_ex entry; consumed on uretprobe return.
+// ssl_read_args — saved on SSL_read entry; consumed on uretprobe return.
 struct ssl_read_args {
-  u64 ssl_ptr;      /* SSL* stored as u64 */
-  u64 buf;          /* void* plaintext buffer */
-  u64 ssl_ex_len;   /* size_t* readbytes — for SSL_read_ex; 0 if SSL_read */
-};
-
-// ssl_write_args — saved on SSL_write/SSL_write_ex entry; consumed on uretprobe return.
-struct ssl_write_args {
-  u64 ssl_ptr;      /* SSL* stored as u64 */
-  u64 buf;          /* const void* plaintext buffer */
-  u64 ssl_ex_len;   /* size_t* written — for SSL_write_ex; 0 if SSL_write */
-};
-
-// nested_syscall_fd_t — tracks the FD from a nested syscall (read/write)
-// that occurs while SSL_read/SSL_write is on the stack.
-// Used by the "nested syscall" FD detection method (primary for OpenSSL/Python).
-struct nested_syscall_fd_t {
-  s32 fd;              /* FD captured from nested syscall; -1 = not yet captured */
-  u8  mismatched_fds;  /* true if multiple different FDs seen during one SSL call */
-  u8  _pad[3];
+  u64 ssl_ptr; /* SSL* stored as u64 */
+  u64 buf;     /* void* plaintext buffer */
 };
 
 // ssl_symaddrs — version-specific OpenSSL struct field offsets.
-// Keyed by TGID in the BPF map (per-process offsets).
-// Detected in userspace and pushed into BPF map.
+// Detected in userspace and added into a BPF map
 struct ssl_symaddrs {
   s32 ssl_rbio_offset; /* offsetof(SSL, rbio) */
   s32 bio_num_offset;  /* offsetof(BIO, num)  — holds the fd */

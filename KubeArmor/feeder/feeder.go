@@ -454,26 +454,6 @@ func (fd *BaseFeeder) DestroyFeeder() error {
 	// stop gRPC service
 	fd.Running = false
 
-	// Stop API observer service subscribers (streaming RPCs).
-	if fd.APIObserverService != nil {
-		fd.APIObserverService.Stop()
-	}
-
-	// Stop gRPC server so active streams don't keep the process alive.
-	if fd.LogServer != nil {
-		done := make(chan struct{})
-		go func() {
-			fd.LogServer.GracefulStop()
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			fd.LogServer.Stop()
-		}
-		fd.LogServer = nil
-	}
-
 	// wait for a while
 	time.Sleep(time.Second * 1)
 

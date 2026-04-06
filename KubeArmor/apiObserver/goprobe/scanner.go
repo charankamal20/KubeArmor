@@ -20,34 +20,6 @@ import (
 	"syscall"
 )
 
-// shouldSkipBinaryPath returns true if this binary is a known high-churn tooling
-// process that commonly exists on nodes (editor helpers, CLIs, Go toolchain).
-//
-// Attaching uprobes broadly is expensive and increases drop risk (replay timeouts).
-// We prefer to skip these by default and focus on actual workload binaries.
-func shouldSkipBinaryPath(hostPath string) bool {
-	p := strings.TrimSpace(hostPath)
-	if p == "" {
-		return true
-	}
-	// procfs sometimes yields " (deleted)" suffix.
-	p = strings.TrimSuffix(p, " (deleted)")
-
-	base := filepath.Base(p)
-	switch base {
-	case "go", "gopls", "dlv", "kubectl", "k9s", "helm", "kind", "kustomize", "minikube":
-		return true
-	}
-
-	// Skip the Go toolchain installation path explicitly.
-	// This is frequently running during builds and is not a workload.
-	if strings.Contains(p, "/usr/local/go/") || strings.Contains(p, "/usr/lib/go/") {
-		return true
-	}
-
-	return false
-}
-
 // LocType mirrors BPF enum go_location_type.
 const (
 	LocInvalid  uint32 = 0
@@ -66,24 +38,23 @@ var InvalidLoc = ArgLocation{Type: LocInvalid, Offset: -1}
 
 // Offset table indices — must match go_http2_symaddrs.h enum go_offset_kind.
 const (
-	GoOffGRPCStreamMethod       = 0
-	GoOffGRPCStreamID           = 1
-	GoOffGRPCTransportConn      = 2
-	GoOffGRPCStatusS            = 3
-	GoOffGRPCStatusCode         = 4
-	GoOffFDSysfd                = 5
-	GoOffConnFD                 = 6
-	GoOffFDLaddr                = 7
-	GoOffFDRaddr                = 8
-	GoOffTCPAddrPort            = 9
-	GoOffTCPAddrIP              = 10
-	GoOffGRPCV160               = 11
-	GoOffGRPCV169               = 12
+	GoOffGRPCStreamMethod      = 0
+	GoOffGRPCStreamID          = 1
+	GoOffGRPCTransportConn     = 2
+	GoOffGRPCStatusS           = 3
+	GoOffGRPCStatusCode        = 4
+	GoOffFDSysfd               = 5
+	GoOffConnFD                = 6
+	GoOffFDLaddr               = 7
+	GoOffFDRaddr               = 8
+	GoOffTCPAddrPort           = 9
+	GoOffTCPAddrIP             = 10
+	GoOffGRPCV160              = 11
+	GoOffGRPCV169              = 12
 	GoOffGRPCServerStreamStream = 13
-	GoOffGRPCServerStreamST     = 14
-	GoOffGRPCStreamST           = 15
-	GoOffTLSConnConn            = 16
-	GoOffMax                    = 17
+	GoOffGRPCServerStreamST    = 14
+	GoOffGRPCStreamST          = 15
+	GoOffMax                   = 16
 )
 
 // GoOffsetTable matches BPF struct go_offset_table.
@@ -97,12 +68,12 @@ type GoOffsetTable struct {
 type GoCommonSymaddrs struct {
 	InternalSyscallConn   int64
 	TlsConn               int64
-	NetTCPConn            int64
-	FD_SysfdOffset        int32
-	TlsConnConnOffset     int32
-	SyscallConnConnOffset int32
-	G_goidOffset          int32
-	G_addrOffset          int32
+	NetTCPConn             int64
+	FD_SysfdOffset         int32
+	TlsConnConnOffset      int32
+	SyscallConnConnOffset  int32
+	G_goidOffset           int32
+	G_addrOffset           int32
 }
 
 // GoUProbeTarget is a Go binary that has gRPC / HTTP/2 symbols.
@@ -138,25 +109,6 @@ var TargetSymbols = map[string][]string{
 	"clientStream_RecvMsg": {
 		"google.golang.org/grpc.(*clientStream).RecvMsg",
 	},
-	// crypto/tls — Go TLS uprobes (Phase 2)
-	"tls_Conn_Write": {
-		"crypto/tls.(*Conn).Write",
-	},
-	"tls_Conn_Read": {
-		"crypto/tls.(*Conn).Read",
-	},
-}
-
-// TLSFuncCandidates returns candidate symbol names for Go crypto/tls probes.
-func TLSFuncCandidates(shortID string) []string {
-	switch shortID {
-	case "tls_Conn_Write":
-		return TargetSymbols["tls_Conn_Write"]
-	case "tls_Conn_Read":
-		return TargetSymbols["tls_Conn_Read"]
-	default:
-		return nil
-	}
 }
 
 // ScanProc scans /proc for Go binaries that use gRPC or net/http HTTP/2.
@@ -201,10 +153,7 @@ func ScanProc() ([]GoUProbeTarget, error) {
 
 	var targets []GoUProbeTarget
 	for hostPath, pids := range binMap {
-		if shouldSkipBinaryPath(hostPath) {
-			continue
-		}
-
+		// Quick check: is it a Go binary?
 		if !isGoBinary(hostPath) {
 			continue
 		}
@@ -319,16 +268,8 @@ func isGoBinary(path string) bool {
 // Returns a map of short_id → virtual address.
 func resolveSymbols(ef *elf.File, path string) (map[string]uint64, error) {
 	allSyms, err := ef.Symbols()
-	if err != nil || len(allSyms) == 0 {
-		// Fallback for binaries with limited regular symbol tables.
-		dynSyms, dynErr := ef.DynamicSymbols()
-		if dynErr != nil {
-			if err != nil {
-				return nil, fmt.Errorf("read symbols from %s: %w", path, err)
-			}
-			return nil, fmt.Errorf("read dynamic symbols from %s: %w", path, dynErr)
-		}
-		allSyms = dynSyms
+	if err != nil {
+		return nil, fmt.Errorf("read symbols from %s: %w", path, err)
 	}
 
 	// Build a map of name → address for quick lookup.
@@ -344,19 +285,13 @@ func resolveSymbols(ef *elf.File, path string) (map[string]uint64, error) {
 		for _, candidate := range candidates {
 			// Try exact match first, then vendor-prefixed match.
 			if addr, ok := symMap[candidate]; ok {
-				off, ok := vaddrToFileOffsetForELF(ef, addr)
-				if ok {
-					result[shortID] = off
-				}
+				result[shortID] = addr
 				break
 			}
 			// Try with vendor prefix: look for suffix match.
 			for name, addr := range symMap {
 				if strings.HasSuffix(name, candidate) {
-					off, ok := vaddrToFileOffsetForELF(ef, addr)
-					if ok {
-						result[shortID] = off
-					}
+					result[shortID] = addr
 					break
 				}
 			}
@@ -364,21 +299,6 @@ func resolveSymbols(ef *elf.File, path string) (map[string]uint64, error) {
 	}
 
 	return result, nil
-}
-
-// vaddrToFileOffsetForELF translates a virtual address to file offset using PT_LOAD segments.
-// perf uprobes require file offsets.
-func vaddrToFileOffsetForELF(ef *elf.File, vaddr uint64) (uint64, bool) {
-	for _, p := range ef.Progs {
-		if p.Type != elf.PT_LOAD {
-			continue
-		}
-		end := p.Vaddr + p.Filesz
-		if vaddr >= p.Vaddr && vaddr < end {
-			return p.Off + (vaddr - p.Vaddr), true
-		}
-	}
-	return 0, false
 }
 
 // resolveItableAddrs is retained for backward compatibility.
@@ -410,6 +330,7 @@ func resolveItableAddrs(ef *elf.File, common *GoCommonSymaddrs) {
 		}
 	}
 }
+
 
 // FindGoHTTP2PIDs returns PIDs of processes using Go gRPC/HTTP2.
 // Useful for targeted scanning instead of full /proc scan.

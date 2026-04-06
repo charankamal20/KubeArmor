@@ -10,9 +10,6 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
-	"os"
-	"path/filepath"
-	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -32,7 +29,7 @@ import (
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 )
 
-//go:generate sh -c "go run github.com/cilium/ebpf/cmd/bpf2go -target $(go env GOARCH) -cc clang apiObserver ../BPF/api_observer.bpf.c"
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -cc clang apiObserver ../BPF/api_observer.bpf.c
 
 // APIObserver captures and processes network events via eBPF.
 type APIObserver struct {
@@ -61,26 +58,15 @@ type APIObserver struct {
 	eventBuf   []*pb.APIEvent
 	eventBufMu sync.Mutex
 
-	// Go uprobe path hints keyed by PID.
-	// Used to recover missing HTTP/2 :path in mid-stream HPACK cases.
-	goPathHints   map[uint32]goPathHint
-	goPathHintsMu sync.RWMutex
-
 	ctx    context.Context
 	cancel context.CancelFunc
 	wg     sync.WaitGroup
 }
 
-type goPathHint struct {
-	path      string
-	updatedAt time.Time
-}
-
 func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserver, error) {
 	ao := &APIObserver{
-		Logger:      logger,
-		nodeName:    node.NodeName,
-		goPathHints: make(map[uint32]goPathHint),
+		Logger:   logger,
+		nodeName: node.NodeName,
 	}
 	ao.ctx, ao.cancel = context.WithCancel(context.Background())
 
@@ -89,10 +75,6 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 		ao.Logger.Errf("Error removing rlimit: %v", err)
 		return nil, err
 	}
-
-	// Clean stale pinned maps that may have incompatible sizes from
-	// a previous run (e.g., go_offsets_map grew from 7→17 entries).
-	cleanStalePins(pinpath, ao.Logger)
 
 	if err = loadApiObserverObjects(&ao.objs, &ebpf.CollectionOptions{
 		Maps: ebpf.MapOptions{PinPath: pinpath},
@@ -145,9 +127,6 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 	// Start background Go HTTP/2 uprobe scanner.
 	go ao.attachGoHTTP2Uprobes()
 
-	// Start background SSL library scanner (HTTPS capture).
-	go ao.attachSSLUprobes()
-
 	return ao, nil
 }
 
@@ -163,44 +142,33 @@ func (ao *APIObserver) attachTracepoint() error {
 }
 
 func (ao *APIObserver) attachKprobes() error {
-	pfx := syscallPrefix()
 	// Egress: write + writev + sendto + sendmsg
-	ao.attachSyscallKprobe(pfx+"write", "ksys_write", ao.objs.KprobeSysWrite)
-	ao.attachSyscallKprobe(pfx+"writev", "sys_writev", ao.objs.KprobeSysWritev)
-	ao.attachSyscallKprobe(pfx+"sendto", "sys_sendto", ao.objs.KprobeSysSendto)
-	ao.attachSyscallKprobe(pfx+"sendmsg", "sys_sendmsg", ao.objs.KprobeSysSendmsg)
+	ao.attachSyscallKprobe("__x64_sys_write", "ksys_write", ao.objs.KprobeSysWrite)
+	ao.attachSyscallKprobe("__x64_sys_writev", "sys_writev", ao.objs.KprobeSysWritev)
+	ao.attachSyscallKprobe("__x64_sys_sendto", "sys_sendto", ao.objs.KprobeSysSendto)
+	ao.attachSyscallKprobe("__x64_sys_sendmsg", "sys_sendmsg", ao.objs.KprobeSysSendmsg)
 
 	// Ingress: read + readv + recvfrom + recvmsg (entry + return)
-	ao.attachSyscallKprobe(pfx+"read", "ksys_read", ao.objs.KprobeSysRead)
-	ao.attachSyscallKretprobe(pfx+"read", "ksys_read", ao.objs.KretprobeSysRead)
-	ao.attachSyscallKprobe(pfx+"readv", "sys_readv", ao.objs.KprobeSysReadv)
-	ao.attachSyscallKretprobe(pfx+"readv", "sys_readv", ao.objs.KretprobeSysReadv)
-	ao.attachSyscallKprobe(pfx+"recvfrom", "sys_recvfrom", ao.objs.KprobeSysRecvfrom)
-	ao.attachSyscallKretprobe(pfx+"recvfrom", "sys_recvfrom", ao.objs.KretprobeSysRecvfrom)
-	ao.attachSyscallKprobe(pfx+"recvmsg", "sys_recvmsg", ao.objs.KprobeSysRecvmsg)
-	ao.attachSyscallKretprobe(pfx+"recvmsg", "sys_recvmsg", ao.objs.KretprobeSysRecvmsg)
+	ao.attachSyscallKprobe("__x64_sys_read", "ksys_read", ao.objs.KprobeSysRead)
+	ao.attachSyscallKretprobe("__x64_sys_read", "ksys_read", ao.objs.KretprobeSysRead)
+	ao.attachSyscallKprobe("__x64_sys_readv", "sys_readv", ao.objs.KprobeSysReadv)
+	ao.attachSyscallKretprobe("__x64_sys_readv", "sys_readv", ao.objs.KretprobeSysReadv)
+	ao.attachSyscallKprobe("__x64_sys_recvfrom", "sys_recvfrom", ao.objs.KprobeSysRecvfrom)
+	ao.attachSyscallKretprobe("__x64_sys_recvfrom", "sys_recvfrom", ao.objs.KretprobeSysRecvfrom)
+	ao.attachSyscallKprobe("__x64_sys_recvmsg", "sys_recvmsg", ao.objs.KprobeSysRecvmsg)
+	ao.attachSyscallKretprobe("__x64_sys_recvmsg", "sys_recvmsg", ao.objs.KretprobeSysRecvmsg)
 
 	// FD lifecycle
-	ao.attachSyscallKprobe(pfx+"connect", "sys_connect", ao.objs.KprobeSysConnect)
-	ao.attachSyscallKretprobe(pfx+"connect", "sys_connect", ao.objs.KretprobeSysConnect)
-	ao.attachSyscallKretprobe(pfx+"accept", "sys_accept", ao.objs.KretprobeSysAccept)
-	ao.attachSyscallKretprobe(pfx+"accept4", "sys_accept4", ao.objs.KretprobeSysAccept4)
-	ao.attachSyscallKprobe(pfx+"close", "sys_close", ao.objs.KprobeSysClose)
+	ao.attachSyscallKprobe("__x64_sys_connect", "sys_connect", ao.objs.KprobeSysConnect)
+	ao.attachSyscallKretprobe("__x64_sys_connect", "sys_connect", ao.objs.KretprobeSysConnect)
+	ao.attachSyscallKretprobe("__x64_sys_accept", "sys_accept", ao.objs.KretprobeSysAccept)
+	ao.attachSyscallKretprobe("__x64_sys_accept4", "sys_accept4", ao.objs.KretprobeSysAccept4)
+	ao.attachSyscallKprobe("__x64_sys_close", "sys_close", ao.objs.KprobeSysClose)
 	return nil
 }
 
-// syscallPrefix returns the architecture-specific kprobe symbol prefix.
-func syscallPrefix() string {
-	switch runtime.GOARCH {
-	case "arm64":
-		return "__arm64_sys_"
-	default:
-		return "__x64_sys_"
-	}
-}
-
-func (ao *APIObserver) attachSyscallKprobe(primary, fallback string, prog *ebpf.Program) {
-	kp, err := link.Kprobe(primary, prog, nil)
+func (ao *APIObserver) attachSyscallKprobe(x64name, fallback string, prog *ebpf.Program) {
+	kp, err := link.Kprobe(x64name, prog, nil)
 	if err != nil {
 		kp, err = link.Kprobe(fallback, prog, nil)
 		if err != nil {
@@ -212,8 +180,8 @@ func (ao *APIObserver) attachSyscallKprobe(primary, fallback string, prog *ebpf.
 	ao.Logger.Printf("Kprobe %s attached (FD lifecycle)", fallback)
 }
 
-func (ao *APIObserver) attachSyscallKretprobe(primary, fallback string, prog *ebpf.Program) {
-	kp, err := link.Kretprobe(primary, prog, nil)
+func (ao *APIObserver) attachSyscallKretprobe(x64name, fallback string, prog *ebpf.Program) {
+	kp, err := link.Kretprobe(x64name, prog, nil)
 	if err != nil {
 		kp, err = link.Kretprobe(fallback, prog, nil)
 		if err != nil {
@@ -339,169 +307,15 @@ func (ao *APIObserver) processGoGRPCEvent(ev *events.GoGRPCRequestEvent) {
 	ao.Logger.Printf("Go uprobe: gRPC %s event pid=%d path=%s status=%d latency=%dns",
 		direction, ev.PID, ev.Path, ev.Status, ev.LatencyNs())
 
-	// Keep a short-lived PID->path hint so the socket pipeline can recover
-	// missing HTTP/2 paths when tracing starts mid-connection.
-	ao.setGoPathHint(ev.PID, ev.Path)
-
-	grpcService, grpcMethod := splitGRPCPath(ev.Path)
-	grpcStatus := int32(ev.Status)
-	httpStatus := int32(200)
-	if grpcStatus != 0 {
-		httpStatus = 500
-	}
-	latencyMs := uint32(ev.LatencyNs() / 1_000_000)
-	if latencyMs == 0 && ev.LatencyNs() > 0 {
-		latencyMs = 1
-	}
-
-	apiEvent := pb.APIEvent{
-		Metadata: &pb.Metadata{
-			Timestamp:    uint64(time.Now().UnixNano()),
-			NodeName:     ao.nodeName,
-			ReceiverName: "KubeArmor",
-		},
-		Source: &pb.Workload{
-			Name: fmt.Sprintf("pid-%d", ev.PID),
-		},
-		Destination: &pb.Workload{
-			Name: "unknown",
-		},
-		Request: &pb.Request{
-			Method: "POST",
-			Path:   ev.Path,
-			Headers: map[string]string{
-				":method":      "POST",
-				":path":        ev.Path,
-				":scheme":      "gRPC",
-				":authority":   "unknown",
-				"content-type": "application/grpc",
-			},
-			GrpcService: grpcService,
-			GrpcMethod:  grpcMethod,
-			ContentType: "application/grpc",
-		},
-		Response: &pb.Response{
-			StatusCode: httpStatus,
-			Headers: map[string]string{
-				":status":     fmt.Sprintf("%d", httpStatus),
-				"grpc-status": fmt.Sprintf("%d", ev.Status),
-			},
-			GrpcStatusCode:    grpcStatus,
-			GrpcStatusMessage: grpcStatusMessage(ev.Status),
-		},
-		Protocol:  "gRPC",
-		LatencyMs: latencyMs,
-	}
-
-	ao.bufferEvent(&apiEvent)
-
 	// Inject into correlator so future kprobe events for this PID
 	// can match the path.
 	ao.correlator.InjectGoGRPCEvent(ev.PID, ev.Path, ev.Status, ev.StartNs, ev.EndNs)
 }
 
-func splitGRPCPath(path string) (service, method string) {
-	p := strings.TrimPrefix(path, "/")
-	parts := strings.SplitN(p, "/", 2)
-	if len(parts) == 2 {
-		return parts[0], parts[1]
-	}
-	return "", ""
-}
-
-func grpcStatusMessage(status uint16) string {
-	switch status {
-	case 0:
-		return "OK"
-	case 1:
-		return "CANCELLED"
-	case 2:
-		return "UNKNOWN"
-	case 3:
-		return "INVALID_ARGUMENT"
-	case 4:
-		return "DEADLINE_EXCEEDED"
-	case 5:
-		return "NOT_FOUND"
-	case 6:
-		return "ALREADY_EXISTS"
-	case 7:
-		return "PERMISSION_DENIED"
-	case 8:
-		return "RESOURCE_EXHAUSTED"
-	case 9:
-		return "FAILED_PRECONDITION"
-	case 10:
-		return "ABORTED"
-	case 11:
-		return "OUT_OF_RANGE"
-	case 12:
-		return "UNIMPLEMENTED"
-	case 13:
-		return "INTERNAL"
-	case 14:
-		return "UNAVAILABLE"
-	case 15:
-		return "DATA_LOSS"
-	case 16:
-		return "UNAUTHENTICATED"
-	default:
-		return "UNKNOWN"
-	}
-}
-
 func (ao *APIObserver) processEvent(ev events.DataEvent) {
 	traces := ao.connManager.Route(&ev)
 	for _, trace := range traces {
-		ao.applyGoPathHint(trace, ev.PID)
 		ao.enrichAndEmit(trace, &ev)
-	}
-}
-
-func (ao *APIObserver) setGoPathHint(pid uint32, path string) {
-	if pid == 0 || path == "" {
-		return
-	}
-	ao.goPathHintsMu.Lock()
-	ao.goPathHints[pid] = goPathHint{
-		path:      path,
-		updatedAt: time.Now(),
-	}
-	ao.goPathHintsMu.Unlock()
-}
-
-func (ao *APIObserver) getGoPathHint(pid uint32, maxAge time.Duration) (string, bool) {
-	if pid == 0 {
-		return "", false
-	}
-
-	ao.goPathHintsMu.RLock()
-	hint, ok := ao.goPathHints[pid]
-	ao.goPathHintsMu.RUnlock()
-	if !ok {
-		return "", false
-	}
-
-	if time.Since(hint.updatedAt) > maxAge {
-		ao.goPathHintsMu.Lock()
-		delete(ao.goPathHints, pid)
-		ao.goPathHintsMu.Unlock()
-		return "", false
-	}
-	return hint.path, true
-}
-
-func (ao *APIObserver) applyGoPathHint(trace *events.CorrelatedTrace, pid uint32) {
-	if trace == nil || trace.URL != "" {
-		return
-	}
-	path, ok := ao.getGoPathHint(pid, 15*time.Second)
-	if !ok || path == "" {
-		return
-	}
-	trace.URL = path
-	if trace.Method == "" {
-		trace.Method = "POST"
 	}
 }
 
@@ -745,213 +559,39 @@ func (ao *APIObserver) resolveWorkload(ip string) (name, namespace string) {
 	return ip, ""
 }
 
-// attachSSLUprobes scans all running processes for loaded SSL libraries
-// (OpenSSL, BoringSSL, libpython, libnetty_tcnative, libconscrypt) using
-// /proc/<pid>/maps and attaches the appropriate BPF uprobes.
-//
-// For each discovered library, it chooses the correct FD extraction method:
-//   - Nested syscall: for OpenSSL/Python — tracks FD from underlying syscall
-//   - Userspace offsets: for BoringSSL/Netty/Conscrypt — walks ssl->rbio->num
-//
-// Runs as a background goroutine with periodic rescan (10s).
-func (ao *APIObserver) attachSSLUprobes() {
-	ao.wg.Add(1)
-	defer ao.wg.Done()
-
-	// Track probed library paths to avoid re-probing.
-	probed := make(map[string]bool)
-
-	// Pre-attach to host-level system libssl.so.* (Pixie-style).
-	// This catches ALL processes using the host's OpenSSL, including
-	// short-lived ones like curl that exit before the per-PID scan.
-	ao.preAttachHostSSL(probed)
-
-	scanAndAttach := func() {
-		pids, err := listPIDs()
-		if err != nil {
-			ao.Logger.Warnf("SSL library scan: failed to list /proc: %v", err)
-			return
-		}
-
-		for _, pid := range pids {
-			select {
-			case <-ao.ctx.Done():
-				return
-			default:
-			}
-			matches := ssl.DiscoverSSLLibsForPID(pid)
-			for _, match := range matches {
-				select {
-				case <-ao.ctx.Done():
-					return
-				default:
-				}
-				// For userspace offset extraction (BoringSSL/Netty/Conscrypt),
-				// offsets are keyed by TGID, so each PID must have a map entry
-				// even when the library uprobes were already attached earlier.
-				if match.FDMethod == ssl.FDMethodUserSpaceOffsets {
-					tgid := pid
-					if err := ao.objs.SslSymaddrs.Put(tgid, match.Offsets); err != nil {
-						ao.Logger.Warnf("SSL: failed to refresh symaddrs for TGID %d: %v", tgid, err)
-					}
-				}
-
-				if probed[match.HostPath] {
-					continue
-				}
-
-				ex, err := link.OpenExecutable(match.HostPath)
-				if err != nil {
-					ao.Logger.Warnf("SSL: failed to open %s: %v", match.HostPath, err)
-					continue
-				}
-
-				probeCount := 0
-
-				switch match.FDMethod {
-				case ssl.FDMethodNestedSyscall:
-					// Nested syscall path: use *_syscall_fd variants
-					probeCount += ao.attachSSLProbe(ex, "SSL_write", ao.objs.UprobeSslWriteSyscallFd, ao.objs.UretprobeSslWriteSyscallFd, match.HostPath)
-					probeCount += ao.attachSSLProbe(ex, "SSL_read", ao.objs.UprobeSslReadSyscallFd, ao.objs.UretprobeSslReadSyscallFd, match.HostPath)
-					probeCount += ao.attachSSLProbe(ex, "SSL_write_ex", ao.objs.UprobeSslWriteExSyscallFd, ao.objs.UretprobeSslWriteExSyscallFd, match.HostPath)
-					probeCount += ao.attachSSLProbe(ex, "SSL_read_ex", ao.objs.UprobeSslReadExSyscallFd, ao.objs.UretprobeSslReadExSyscallFd, match.HostPath)
-
-				case ssl.FDMethodUserSpaceOffsets:
-					// Use standard uprobe/uretprobe (struct offset FD extraction)
-					probeCount += ao.attachSSLProbe(ex, "SSL_write", ao.objs.UprobeSslWrite, ao.objs.UretprobeSslWrite, match.HostPath)
-					probeCount += ao.attachSSLProbe(ex, "SSL_read", ao.objs.UprobeSslRead, ao.objs.UretprobeSslRead, match.HostPath)
-				}
-
-				// Always attach SSL_shutdown for cleanup
-				if l, err := ex.Uprobe("SSL_shutdown", ao.objs.UprobeSslShutdown, nil); err == nil {
-					ao.links = append(ao.links, l)
-					probeCount++
-				}
-
-				if probeCount > 0 {
-					probed[match.HostPath] = true
-					ao.Logger.Printf("Attached %d SSL uprobes [%s] on %s (PID %d, FD: %s)",
-						probeCount, match.LibType, match.HostPath, pid, fdMethodStr(match.FDMethod))
-				}
-			}
-		}
-	}
-
-	// Initial per-PID scan (catches container-bundled libraries).
-	scanAndAttach()
-
-	// Periodic rescan for new processes/libraries (every 10s — Pixie uses ~5-15s).
-	ticker := time.NewTicker(10 * time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ao.ctx.Done():
-			return
-		case <-ticker.C:
-			scanAndAttach()
-		}
-	}
-}
-
-// preAttachHostSSL attaches SSL uprobes to system-wide libssl.so.* paths.
-// This is the Pixie-equivalent approach (kOpenSSLUProbes with known paths):
-// by probing the host's OpenSSL libraries directly, we capture ALL processes
-// that use them — including short-lived clients like curl that exit before
-// the per-PID /proc/maps scanner runs.
-func (ao *APIObserver) preAttachHostSSL(probed map[string]bool) {
-	paths, err := ssl.LibSSLPaths()
+// SSL uprobes -> currently not being called. In Progress
+func (ao *APIObserver) attachSSLUprobes() error {
+	libPaths, err := ssl.LibSSLPaths()
 	if err != nil {
-		ao.Logger.Warnf("SSL pre-attach: no system libssl found: %v", err)
-		return
+		ao.Logger.Warnf("libssl not found, HTTPS capture disabled: %v", err)
+		return nil
 	}
-
-	for _, libPath := range paths {
-		if probed[libPath] {
+	for _, libPath := range libPaths {
+		offsets, err := ssl.OffsetsForLib(libPath)
+		if err != nil {
+			ao.Logger.Warnf("SSL struct offsets unknown for %s: %v", libPath, err)
 			continue
 		}
-
+		if err := ao.objs.SslSymaddrs.Put(uint32(0), offsets); err != nil {
+			return fmt.Errorf("ssl_symaddrs update: %w", err)
+		}
 		ex, err := link.OpenExecutable(libPath)
 		if err != nil {
-			ao.Logger.Warnf("SSL pre-attach: failed to open %s: %v", libPath, err)
-			continue
+			return fmt.Errorf("open %s: %w", libPath, err)
 		}
-
-		probeCount := 0
-		// Host OpenSSL always uses nested syscall FD method
-		probeCount += ao.attachSSLProbe(ex, "SSL_write", ao.objs.UprobeSslWriteSyscallFd, ao.objs.UretprobeSslWriteSyscallFd, libPath)
-		probeCount += ao.attachSSLProbe(ex, "SSL_read", ao.objs.UprobeSslReadSyscallFd, ao.objs.UretprobeSslReadSyscallFd, libPath)
-		probeCount += ao.attachSSLProbe(ex, "SSL_write_ex", ao.objs.UprobeSslWriteExSyscallFd, ao.objs.UretprobeSslWriteExSyscallFd, libPath)
-		probeCount += ao.attachSSLProbe(ex, "SSL_read_ex", ao.objs.UprobeSslReadExSyscallFd, ao.objs.UretprobeSslReadExSyscallFd, libPath)
-
-		if l, err := ex.Uprobe("SSL_shutdown", ao.objs.UprobeSslShutdown, nil); err == nil {
+		if l, err := ex.Uprobe("SSL_write", ao.objs.UprobeSslWrite, nil); err == nil {
 			ao.links = append(ao.links, l)
-			probeCount++
+			ao.Logger.Printf("uprobe/SSL_write attached (%s)", libPath)
 		}
-
-		if probeCount > 0 {
-			probed[libPath] = true
-			ao.Logger.Printf("SSL pre-attach: attached %d uprobes to host %s", probeCount, libPath)
-		}
-	}
-}
-
-// attachSSLProbe attaches an uprobe+uretprobe pair to a symbol.
-// Returns the count of successfully attached probes (0, 1, or 2).
-func (ao *APIObserver) attachSSLProbe(
-	ex *link.Executable,
-	symbol string,
-	entry *ebpf.Program,
-	ret *ebpf.Program,
-	libPath string,
-) int {
-	count := 0
-	if entry != nil {
-		if l, err := ex.Uprobe(symbol, entry, nil); err == nil {
-			ao.links = append(ao.links, l)
-			count++
-		} else {
-			slog.Warn("SSL uprobe attach failed", "symbol", symbol, "lib", libPath, "err", err)
+		if lEntry, err := ex.Uprobe("SSL_read", ao.objs.UprobeSslRead, nil); err == nil {
+			ao.links = append(ao.links, lEntry)
+			if lRet, err := ex.Uretprobe("SSL_read", ao.objs.UretprobeSslRead, nil); err == nil {
+				ao.links = append(ao.links, lRet)
+				ao.Logger.Printf("uprobe+uretprobe/SSL_read attached (%s)", libPath)
+			}
 		}
 	}
-	if ret != nil {
-		if l, err := ex.Uretprobe(symbol, ret, nil); err == nil {
-			ao.links = append(ao.links, l)
-			count++
-		} else {
-			slog.Warn("SSL uretprobe attach failed", "symbol", symbol, "lib", libPath, "err", err)
-		}
-	}
-	return count
-}
-
-// listPIDs scans /proc for numeric entries (PIDs).
-func listPIDs() ([]uint32, error) {
-	entries, err := os.ReadDir("/proc")
-	if err != nil {
-		return nil, err
-	}
-	var pids []uint32
-	for _, e := range entries {
-		if !e.IsDir() {
-			continue
-		}
-		var pid uint32
-		if _, err := fmt.Sscanf(e.Name(), "%d", &pid); err == nil && pid > 0 {
-			pids = append(pids, pid)
-		}
-	}
-	return pids, nil
-}
-
-func fdMethodStr(m ssl.FDAccessMethod) string {
-	switch m {
-	case ssl.FDMethodNestedSyscall:
-		return "nested_syscall"
-	case ssl.FDMethodUserSpaceOffsets:
-		return "userspace_offsets"
-	default:
-		return "unknown"
-	}
+	return nil
 }
 
 // attachGoHTTP2Uprobes scans for Go HTTP/2 binaries and attaches uprobes.
@@ -961,32 +601,15 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 	defer ao.wg.Done()
 
 	// Map of uprobe short IDs → BPF programs.
-	// For Go functions, prefer ret-instruction uprobes over uretprobes (Pixie kReturnInsts).
+	// For uretprobes, the key gets a "_ret" suffix.
 	probeMap := map[string]*ebpf.Program{
 		"server_handleStream":      ao.objs.KaUprobeServerHandleStream,
-		"server_handleStream_ret":  nil, // legacy uretprobe (disabled for Go safety)
+		"server_handleStream_ret":  ao.objs.KaUretprobeServerHandleStream,
 		"transport_writeStatus":    ao.objs.KaUprobeTransportWriteStatus,
 		"ClientConn_Invoke":        ao.objs.KaUprobeClientConnInvoke,
-		"ClientConn_Invoke_ret":    nil, // legacy uretprobe (disabled for Go safety)
+		"ClientConn_Invoke_ret":    ao.objs.KaUretprobeClientConnInvoke,
 		"ClientConn_NewStream":     ao.objs.KaUprobeClientConnNewStream,
-		"clientStream_RecvMsg_ret": nil, // legacy uretprobe (disabled for Go safety)
-	}
-	// Go crypto/tls tracing must follow Pixie's approach: attach "return" probes
-	// as entry uprobes at every RET instruction (not uretprobes), otherwise the
-	// Go runtime can crash with "unexpected return pc".
-	tlsEntryMap := map[string]*ebpf.Program{
-		"tls_Conn_Write": ao.objs.KaUprobeTlsConnWrite,
-		"tls_Conn_Read":  ao.objs.KaUprobeTlsConnRead,
-	}
-	tlsRetInstMap := map[string]*ebpf.Program{
-		"tls_Conn_Write_retinst": ao.objs.KaUprobeTlsConnWriteRetinst,
-		"tls_Conn_Read_retinst":  ao.objs.KaUprobeTlsConnReadRetinst,
-	}
-
-	grpcRetInstMap := map[string]*ebpf.Program{
-		"server_handleStream_retinst":  ao.objs.KaUprobeServerHandleStreamRetinst,
-		"ClientConn_Invoke_retinst":    ao.objs.KaUprobeClientConnInvokeRetinst,
-		"clientStream_RecvMsg_retinst": ao.objs.KaUprobeClientStreamRecvMsgRetinst,
+		"clientStream_RecvMsg_ret": ao.objs.KaUretprobeClientStreamRecvMsg,
 	}
 
 	// Track attached binaries to avoid re-probing.
@@ -1000,11 +623,6 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 		}
 
 		for _, target := range targets {
-			select {
-			case <-ao.ctx.Done():
-				return
-			default:
-			}
 			if attached[target.BinaryPath] {
 				// Already probed this binary — just ensure BPF maps are populated.
 				ao.populateGoBPFMaps(target)
@@ -1026,11 +644,6 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 
 			probeCount := 0
 			for shortID, addr := range target.Symbols {
-				select {
-				case <-ao.ctx.Done():
-					return
-				default:
-				}
 				// Attach entry uprobe.
 				if prog, ok := probeMap[shortID]; ok {
 					l, err := ex.Uprobe("", prog, &link.UprobeOptions{
@@ -1046,91 +659,21 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 					}
 				}
 
-			}
-
-			// Attach Go gRPC ret-instruction probes (Pixie kReturnInsts model).
-			for retID, retProg := range grpcRetInstMap {
-				select {
-				case <-ao.ctx.Done():
-					return
-				default:
-				}
-				baseID := strings.TrimSuffix(retID, "_retinst")
-				cands := goprobe.TargetSymbols[baseID]
-				if len(cands) == 0 {
-					continue
-				}
-				retOffs, err := goprobe.FuncRetInstOffsets(target.BinaryPath, cands)
-				if err != nil {
-					ao.Logger.Warnf("Failed to find RET instructions for %s in %s: %v", baseID, target.BinaryPath, err)
-					continue
-				}
-				for _, ro := range retOffs {
-					select {
-					case <-ao.ctx.Done():
-						return
-					default:
-					}
-					if l, err := ex.Uprobe("", retProg, &link.UprobeOptions{Address: ro}); err == nil {
+				// Attach return uprobe (uretprobe) if it exists.
+				retKey := shortID + "_ret"
+				if retProg, ok := probeMap[retKey]; ok {
+					l, err := ex.Uprobe("", retProg, &link.UprobeOptions{
+						Address: addr,
+					})
+					if err != nil {
+						ao.Logger.Warnf("Failed to attach uretprobe %s at 0x%x on %s: %v",
+							retKey, addr, target.BinaryPath, err)
+					} else {
 						ao.links = append(ao.links, l)
 						probeCount++
-					} else {
-						ao.Logger.Warnf("Failed to attach gRPC retinst uprobe %s at 0x%x on %s: %v",
-							retID, ro, target.BinaryPath, err)
+						ao.Logger.Printf("  uretprobe/%s attached at 0x%x", retKey, addr)
 					}
 				}
-				ao.Logger.Printf("  uprobe/%s attached at %d RET sites", retID, len(retOffs))
-			}
-
-			// Attach Go TLS return-instruction probes (Pixie kReturnInsts model).
-			for shortID, entryProg := range tlsEntryMap {
-				select {
-				case <-ao.ctx.Done():
-					return
-				default:
-				}
-				addr, ok := target.Symbols[shortID]
-				if !ok {
-					continue
-				}
-				// Entry attach at function start.
-				if l, err := ex.Uprobe("", entryProg, &link.UprobeOptions{Address: addr}); err == nil {
-					ao.links = append(ao.links, l)
-					probeCount++
-					ao.Logger.Printf("  uprobe/%s attached at 0x%x", shortID, addr)
-				} else {
-					ao.Logger.Warnf("Failed to attach TLS entry uprobe %s at 0x%x on %s: %v",
-						shortID, addr, target.BinaryPath, err)
-					continue
-				}
-
-				cands := goprobe.TLSFuncCandidates(shortID)
-				retOffs, err := goprobe.FuncRetInstOffsets(target.BinaryPath, cands)
-				if err != nil {
-					ao.Logger.Warnf("Failed to find RET instructions for %s in %s: %v", shortID, target.BinaryPath, err)
-					continue
-				}
-
-				retProg := tlsRetInstMap[shortID+"_retinst"]
-				if retProg == nil {
-					ao.Logger.Warnf("TLS retinst program missing for %s", shortID)
-					continue
-				}
-				for _, ro := range retOffs {
-					select {
-					case <-ao.ctx.Done():
-						return
-					default:
-					}
-					if l, err := ex.Uprobe("", retProg, &link.UprobeOptions{Address: ro}); err == nil {
-						ao.links = append(ao.links, l)
-						probeCount++
-					} else {
-						ao.Logger.Warnf("Failed to attach TLS retinst uprobe %s at 0x%x on %s: %v",
-							shortID+"_retinst", ro, target.BinaryPath, err)
-					}
-				}
-				ao.Logger.Printf("  uprobe/%s attached at %d RET sites", shortID+"_retinst", len(retOffs))
 			}
 
 			if probeCount > 0 {
@@ -1219,46 +762,6 @@ func (ao *APIObserver) DestroyAPIObserver() error {
 	if ao.connManager != nil {
 		ao.connManager.Stop()
 	}
-	// Wait for all APIObserver goroutines to exit, but log if it takes long.
-	waitCh := make(chan struct{})
-	go func() {
-		ao.wg.Wait()
-		close(waitCh)
-	}()
-	select {
-	case <-waitCh:
-	case <-time.After(10 * time.Second):
-		ao.Logger.Warn("API Observer shutdown taking >5s (waiting for background goroutines to exit)")
-		<-waitCh
-	}
+	ao.wg.Wait()
 	return cleanupErr
-}
-
-// cleanStalePins removes pinned BPF maps whose key/value sizes no longer
-// match the current BPF object. This prevents verifier failures when struct
-// layouts change between builds (e.g., go_offsets_map grew from 7→17 entries).
-func cleanStalePins(pinpath string, logger fd.Feeder) {
-	spec, err := loadApiObserver()
-	if err != nil {
-		return
-	}
-	for name, mapSpec := range spec.Maps {
-		pinFile := filepath.Join(pinpath, name)
-		m, err := ebpf.LoadPinnedMap(pinFile, nil)
-		if err != nil {
-			continue // Not pinned or can't open — nothing to clean.
-		}
-		info, err := m.Info()
-		m.Close()
-		if err != nil {
-			continue
-		}
-		// Compare key and value sizes from the running (pinned) map
-		// against what the current BPF object expects.
-		if info.KeySize != mapSpec.KeySize || info.ValueSize != mapSpec.ValueSize {
-			logger.Printf("Removing stale pinned map %s (pinned key/value %d/%d, expected %d/%d)",
-				name, info.KeySize, info.ValueSize, mapSpec.KeySize, mapSpec.ValueSize)
-			os.Remove(pinFile)
-		}
-	}
 }

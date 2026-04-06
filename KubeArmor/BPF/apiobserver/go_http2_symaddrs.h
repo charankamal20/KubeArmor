@@ -45,9 +45,6 @@ enum go_offset_kind {
   /* stream.st pointer (pre-v1.69) */
   GO_OFF_GRPC_STREAM_ST = 15,
 
-  /* crypto/tls.Conn.conn — net.Conn interface offset within tls.Conn */
-  GO_OFF_TLS_CONN_CONN = 16,
-
   GO_OFF_MAX,
 };
 

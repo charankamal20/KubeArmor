@@ -122,40 +122,19 @@ type apiObserverGoGrpcServerInvocation struct {
 
 type apiObserverGoOffsetTable struct {
 	_       structs.HostLayout
-	Offsets [17]int64
-}
-
-type apiObserverGoTlsConnArgs struct {
-	_            structs.HostLayout
-	ConnPtr      uint64
-	PlaintextPtr uint64
-}
-
-type apiObserverNestedSyscallFdT struct {
-	_             structs.HostLayout
-	Fd            int32
-	MismatchedFds uint8
-	Pad           [3]uint8
+	Offsets [16]int64
 }
 
 type apiObserverSslReadArgs struct {
-	_        structs.HostLayout
-	SslPtr   uint64
-	Buf      uint64
-	SslExLen uint64
+	_      structs.HostLayout
+	SslPtr uint64
+	Buf    uint64
 }
 
 type apiObserverSslSymaddrs struct {
 	_             structs.HostLayout
 	SslRbioOffset int32
 	BioNumOffset  int32
-}
-
-type apiObserverSslWriteArgs struct {
-	_        structs.HostLayout
-	SslPtr   uint64
-	Buf      uint64
-	SslExLen uint64
 }
 
 type apiObserverStats struct {
@@ -211,48 +190,34 @@ type apiObserverSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type apiObserverProgramSpecs struct {
-	KaUprobeClientConnInvoke           *ebpf.ProgramSpec `ebpf:"ka_uprobe_ClientConn_Invoke"`
-	KaUprobeClientConnInvokeRetinst    *ebpf.ProgramSpec `ebpf:"ka_uprobe_ClientConn_Invoke_retinst"`
-	KaUprobeClientConnNewStream        *ebpf.ProgramSpec `ebpf:"ka_uprobe_ClientConn_NewStream"`
-	KaUprobeClientStreamRecvMsgRetinst *ebpf.ProgramSpec `ebpf:"ka_uprobe_clientStream_RecvMsg_retinst"`
-	KaUprobeServerHandleStream         *ebpf.ProgramSpec `ebpf:"ka_uprobe_server_handleStream"`
-	KaUprobeServerHandleStreamRetinst  *ebpf.ProgramSpec `ebpf:"ka_uprobe_server_handleStream_retinst"`
-	KaUprobeTlsConnRead                *ebpf.ProgramSpec `ebpf:"ka_uprobe_tls_conn_read"`
-	KaUprobeTlsConnReadRetinst         *ebpf.ProgramSpec `ebpf:"ka_uprobe_tls_conn_read_retinst"`
-	KaUprobeTlsConnWrite               *ebpf.ProgramSpec `ebpf:"ka_uprobe_tls_conn_write"`
-	KaUprobeTlsConnWriteRetinst        *ebpf.ProgramSpec `ebpf:"ka_uprobe_tls_conn_write_retinst"`
-	KaUprobeTransportWriteStatus       *ebpf.ProgramSpec `ebpf:"ka_uprobe_transport_writeStatus"`
-	KprobeSysClose                     *ebpf.ProgramSpec `ebpf:"kprobe_sys_close"`
-	KprobeSysConnect                   *ebpf.ProgramSpec `ebpf:"kprobe_sys_connect"`
-	KprobeSysRead                      *ebpf.ProgramSpec `ebpf:"kprobe_sys_read"`
-	KprobeSysReadv                     *ebpf.ProgramSpec `ebpf:"kprobe_sys_readv"`
-	KprobeSysRecvfrom                  *ebpf.ProgramSpec `ebpf:"kprobe_sys_recvfrom"`
-	KprobeSysRecvmsg                   *ebpf.ProgramSpec `ebpf:"kprobe_sys_recvmsg"`
-	KprobeSysSendmsg                   *ebpf.ProgramSpec `ebpf:"kprobe_sys_sendmsg"`
-	KprobeSysSendto                    *ebpf.ProgramSpec `ebpf:"kprobe_sys_sendto"`
-	KprobeSysWrite                     *ebpf.ProgramSpec `ebpf:"kprobe_sys_write"`
-	KprobeSysWritev                    *ebpf.ProgramSpec `ebpf:"kprobe_sys_writev"`
-	KretprobeSysAccept                 *ebpf.ProgramSpec `ebpf:"kretprobe_sys_accept"`
-	KretprobeSysAccept4                *ebpf.ProgramSpec `ebpf:"kretprobe_sys_accept4"`
-	KretprobeSysConnect                *ebpf.ProgramSpec `ebpf:"kretprobe_sys_connect"`
-	KretprobeSysRead                   *ebpf.ProgramSpec `ebpf:"kretprobe_sys_read"`
-	KretprobeSysReadv                  *ebpf.ProgramSpec `ebpf:"kretprobe_sys_readv"`
-	KretprobeSysRecvfrom               *ebpf.ProgramSpec `ebpf:"kretprobe_sys_recvfrom"`
-	KretprobeSysRecvmsg                *ebpf.ProgramSpec `ebpf:"kretprobe_sys_recvmsg"`
-	TracepointInetSockSetState         *ebpf.ProgramSpec `ebpf:"tracepoint_inet_sock_set_state"`
-	UprobeSslRead                      *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read"`
-	UprobeSslReadExSyscallFd           *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_ex_syscall_fd"`
-	UprobeSslReadSyscallFd             *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read_syscall_fd"`
-	UprobeSslShutdown                  *ebpf.ProgramSpec `ebpf:"uprobe_ssl_shutdown"`
-	UprobeSslWrite                     *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write"`
-	UprobeSslWriteExSyscallFd          *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_ex_syscall_fd"`
-	UprobeSslWriteSyscallFd            *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write_syscall_fd"`
-	UretprobeSslRead                   *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read"`
-	UretprobeSslReadExSyscallFd        *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_ex_syscall_fd"`
-	UretprobeSslReadSyscallFd          *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read_syscall_fd"`
-	UretprobeSslWrite                  *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write"`
-	UretprobeSslWriteExSyscallFd       *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_ex_syscall_fd"`
-	UretprobeSslWriteSyscallFd         *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_write_syscall_fd"`
+	KaUprobeClientConnInvoke       *ebpf.ProgramSpec `ebpf:"ka_uprobe_ClientConn_Invoke"`
+	KaUprobeClientConnNewStream    *ebpf.ProgramSpec `ebpf:"ka_uprobe_ClientConn_NewStream"`
+	KaUprobeServerHandleStream     *ebpf.ProgramSpec `ebpf:"ka_uprobe_server_handleStream"`
+	KaUprobeTransportWriteStatus   *ebpf.ProgramSpec `ebpf:"ka_uprobe_transport_writeStatus"`
+	KaUretprobeClientConnInvoke    *ebpf.ProgramSpec `ebpf:"ka_uretprobe_ClientConn_Invoke"`
+	KaUretprobeClientStreamRecvMsg *ebpf.ProgramSpec `ebpf:"ka_uretprobe_clientStream_RecvMsg"`
+	KaUretprobeServerHandleStream  *ebpf.ProgramSpec `ebpf:"ka_uretprobe_server_handleStream"`
+	KprobeSysClose                 *ebpf.ProgramSpec `ebpf:"kprobe_sys_close"`
+	KprobeSysConnect               *ebpf.ProgramSpec `ebpf:"kprobe_sys_connect"`
+	KprobeSysRead                  *ebpf.ProgramSpec `ebpf:"kprobe_sys_read"`
+	KprobeSysReadv                 *ebpf.ProgramSpec `ebpf:"kprobe_sys_readv"`
+	KprobeSysRecvfrom              *ebpf.ProgramSpec `ebpf:"kprobe_sys_recvfrom"`
+	KprobeSysRecvmsg               *ebpf.ProgramSpec `ebpf:"kprobe_sys_recvmsg"`
+	KprobeSysSendmsg               *ebpf.ProgramSpec `ebpf:"kprobe_sys_sendmsg"`
+	KprobeSysSendto                *ebpf.ProgramSpec `ebpf:"kprobe_sys_sendto"`
+	KprobeSysWrite                 *ebpf.ProgramSpec `ebpf:"kprobe_sys_write"`
+	KprobeSysWritev                *ebpf.ProgramSpec `ebpf:"kprobe_sys_writev"`
+	KretprobeSysAccept             *ebpf.ProgramSpec `ebpf:"kretprobe_sys_accept"`
+	KretprobeSysAccept4            *ebpf.ProgramSpec `ebpf:"kretprobe_sys_accept4"`
+	KretprobeSysConnect            *ebpf.ProgramSpec `ebpf:"kretprobe_sys_connect"`
+	KretprobeSysRead               *ebpf.ProgramSpec `ebpf:"kretprobe_sys_read"`
+	KretprobeSysReadv              *ebpf.ProgramSpec `ebpf:"kretprobe_sys_readv"`
+	KretprobeSysRecvfrom           *ebpf.ProgramSpec `ebpf:"kretprobe_sys_recvfrom"`
+	KretprobeSysRecvmsg            *ebpf.ProgramSpec `ebpf:"kretprobe_sys_recvmsg"`
+	TracepointInetSockSetState     *ebpf.ProgramSpec `ebpf:"tracepoint_inet_sock_set_state"`
+	UprobeSslRead                  *ebpf.ProgramSpec `ebpf:"uprobe_ssl_read"`
+	UprobeSslWrite                 *ebpf.ProgramSpec `ebpf:"uprobe_ssl_write"`
+	UretprobeSslRead               *ebpf.ProgramSpec `ebpf:"uretprobe_ssl_read"`
 }
 
 // apiObserverMapSpecs contains maps before they are loaded into the kernel.
@@ -262,9 +227,7 @@ type apiObserverMapSpecs struct {
 	ActiveAcceptArgs          *ebpf.MapSpec `ebpf:"active_accept_args"`
 	ActiveConnectArgs         *ebpf.MapSpec `ebpf:"active_connect_args"`
 	ActiveDataArgs            *ebpf.MapSpec `ebpf:"active_data_args"`
-	ActiveGoTlsConnOp         *ebpf.MapSpec `ebpf:"active_go_tls_conn_op"`
 	ActiveSslReadArgs         *ebpf.MapSpec `ebpf:"active_ssl_read_args"`
-	ActiveSslWriteArgs        *ebpf.MapSpec `ebpf:"active_ssl_write_args"`
 	ApiobserverEvents         *ebpf.MapSpec `ebpf:"apiobserver_events"`
 	ArgsBufk                  *ebpf.MapSpec `ebpf:"args_bufk"`
 	Bufk                      *ebpf.MapSpec `ebpf:"bufk"`
@@ -276,7 +239,6 @@ type apiObserverMapSpecs struct {
 	EventScratch              *ebpf.MapSpec `ebpf:"event_scratch"`
 	GoHttp2Events             *ebpf.MapSpec `ebpf:"go_http2_events"`
 	GoOffsetsMap              *ebpf.MapSpec `ebpf:"go_offsets_map"`
-	GoTlsUserSpaceCallMap     *ebpf.MapSpec `ebpf:"go_tls_user_space_call_map"`
 	KubearmorAlertThrottle    *ebpf.MapSpec `ebpf:"kubearmor_alert_throttle"`
 	KubearmorArgsStore        *ebpf.MapSpec `ebpf:"kubearmor_args_store"`
 	KubearmorArguments        *ebpf.MapSpec `ebpf:"kubearmor_arguments"`
@@ -290,7 +252,6 @@ type apiObserverMapSpecs struct {
 	PidFdToSock               *ebpf.MapSpec `ebpf:"pid_fd_to_sock"`
 	SockToConnId              *ebpf.MapSpec `ebpf:"sock_to_conn_id"`
 	SslSymaddrs               *ebpf.MapSpec `ebpf:"ssl_symaddrs"`
-	SslUserSpaceCallMap       *ebpf.MapSpec `ebpf:"ssl_user_space_call_map"`
 	StatsMap                  *ebpf.MapSpec `ebpf:"stats_map"`
 }
 
@@ -323,9 +284,7 @@ type apiObserverMaps struct {
 	ActiveAcceptArgs          *ebpf.Map `ebpf:"active_accept_args"`
 	ActiveConnectArgs         *ebpf.Map `ebpf:"active_connect_args"`
 	ActiveDataArgs            *ebpf.Map `ebpf:"active_data_args"`
-	ActiveGoTlsConnOp         *ebpf.Map `ebpf:"active_go_tls_conn_op"`
 	ActiveSslReadArgs         *ebpf.Map `ebpf:"active_ssl_read_args"`
-	ActiveSslWriteArgs        *ebpf.Map `ebpf:"active_ssl_write_args"`
 	ApiobserverEvents         *ebpf.Map `ebpf:"apiobserver_events"`
 	ArgsBufk                  *ebpf.Map `ebpf:"args_bufk"`
 	Bufk                      *ebpf.Map `ebpf:"bufk"`
@@ -337,7 +296,6 @@ type apiObserverMaps struct {
 	EventScratch              *ebpf.Map `ebpf:"event_scratch"`
 	GoHttp2Events             *ebpf.Map `ebpf:"go_http2_events"`
 	GoOffsetsMap              *ebpf.Map `ebpf:"go_offsets_map"`
-	GoTlsUserSpaceCallMap     *ebpf.Map `ebpf:"go_tls_user_space_call_map"`
 	KubearmorAlertThrottle    *ebpf.Map `ebpf:"kubearmor_alert_throttle"`
 	KubearmorArgsStore        *ebpf.Map `ebpf:"kubearmor_args_store"`
 	KubearmorArguments        *ebpf.Map `ebpf:"kubearmor_arguments"`
@@ -351,7 +309,6 @@ type apiObserverMaps struct {
 	PidFdToSock               *ebpf.Map `ebpf:"pid_fd_to_sock"`
 	SockToConnId              *ebpf.Map `ebpf:"sock_to_conn_id"`
 	SslSymaddrs               *ebpf.Map `ebpf:"ssl_symaddrs"`
-	SslUserSpaceCallMap       *ebpf.Map `ebpf:"ssl_user_space_call_map"`
 	StatsMap                  *ebpf.Map `ebpf:"stats_map"`
 }
 
@@ -360,9 +317,7 @@ func (m *apiObserverMaps) Close() error {
 		m.ActiveAcceptArgs,
 		m.ActiveConnectArgs,
 		m.ActiveDataArgs,
-		m.ActiveGoTlsConnOp,
 		m.ActiveSslReadArgs,
-		m.ActiveSslWriteArgs,
 		m.ApiobserverEvents,
 		m.ArgsBufk,
 		m.Bufk,
@@ -374,7 +329,6 @@ func (m *apiObserverMaps) Close() error {
 		m.EventScratch,
 		m.GoHttp2Events,
 		m.GoOffsetsMap,
-		m.GoTlsUserSpaceCallMap,
 		m.KubearmorAlertThrottle,
 		m.KubearmorArgsStore,
 		m.KubearmorArguments,
@@ -388,7 +342,6 @@ func (m *apiObserverMaps) Close() error {
 		m.PidFdToSock,
 		m.SockToConnId,
 		m.SslSymaddrs,
-		m.SslUserSpaceCallMap,
 		m.StatsMap,
 	)
 }
@@ -403,63 +356,45 @@ type apiObserverVariables struct {
 //
 // It can be passed to loadApiObserverObjects or ebpf.CollectionSpec.LoadAndAssign.
 type apiObserverPrograms struct {
-	KaUprobeClientConnInvoke           *ebpf.Program `ebpf:"ka_uprobe_ClientConn_Invoke"`
-	KaUprobeClientConnInvokeRetinst    *ebpf.Program `ebpf:"ka_uprobe_ClientConn_Invoke_retinst"`
-	KaUprobeClientConnNewStream        *ebpf.Program `ebpf:"ka_uprobe_ClientConn_NewStream"`
-	KaUprobeClientStreamRecvMsgRetinst *ebpf.Program `ebpf:"ka_uprobe_clientStream_RecvMsg_retinst"`
-	KaUprobeServerHandleStream         *ebpf.Program `ebpf:"ka_uprobe_server_handleStream"`
-	KaUprobeServerHandleStreamRetinst  *ebpf.Program `ebpf:"ka_uprobe_server_handleStream_retinst"`
-	KaUprobeTlsConnRead                *ebpf.Program `ebpf:"ka_uprobe_tls_conn_read"`
-	KaUprobeTlsConnReadRetinst         *ebpf.Program `ebpf:"ka_uprobe_tls_conn_read_retinst"`
-	KaUprobeTlsConnWrite               *ebpf.Program `ebpf:"ka_uprobe_tls_conn_write"`
-	KaUprobeTlsConnWriteRetinst        *ebpf.Program `ebpf:"ka_uprobe_tls_conn_write_retinst"`
-	KaUprobeTransportWriteStatus       *ebpf.Program `ebpf:"ka_uprobe_transport_writeStatus"`
-	KprobeSysClose                     *ebpf.Program `ebpf:"kprobe_sys_close"`
-	KprobeSysConnect                   *ebpf.Program `ebpf:"kprobe_sys_connect"`
-	KprobeSysRead                      *ebpf.Program `ebpf:"kprobe_sys_read"`
-	KprobeSysReadv                     *ebpf.Program `ebpf:"kprobe_sys_readv"`
-	KprobeSysRecvfrom                  *ebpf.Program `ebpf:"kprobe_sys_recvfrom"`
-	KprobeSysRecvmsg                   *ebpf.Program `ebpf:"kprobe_sys_recvmsg"`
-	KprobeSysSendmsg                   *ebpf.Program `ebpf:"kprobe_sys_sendmsg"`
-	KprobeSysSendto                    *ebpf.Program `ebpf:"kprobe_sys_sendto"`
-	KprobeSysWrite                     *ebpf.Program `ebpf:"kprobe_sys_write"`
-	KprobeSysWritev                    *ebpf.Program `ebpf:"kprobe_sys_writev"`
-	KretprobeSysAccept                 *ebpf.Program `ebpf:"kretprobe_sys_accept"`
-	KretprobeSysAccept4                *ebpf.Program `ebpf:"kretprobe_sys_accept4"`
-	KretprobeSysConnect                *ebpf.Program `ebpf:"kretprobe_sys_connect"`
-	KretprobeSysRead                   *ebpf.Program `ebpf:"kretprobe_sys_read"`
-	KretprobeSysReadv                  *ebpf.Program `ebpf:"kretprobe_sys_readv"`
-	KretprobeSysRecvfrom               *ebpf.Program `ebpf:"kretprobe_sys_recvfrom"`
-	KretprobeSysRecvmsg                *ebpf.Program `ebpf:"kretprobe_sys_recvmsg"`
-	TracepointInetSockSetState         *ebpf.Program `ebpf:"tracepoint_inet_sock_set_state"`
-	UprobeSslRead                      *ebpf.Program `ebpf:"uprobe_ssl_read"`
-	UprobeSslReadExSyscallFd           *ebpf.Program `ebpf:"uprobe_ssl_read_ex_syscall_fd"`
-	UprobeSslReadSyscallFd             *ebpf.Program `ebpf:"uprobe_ssl_read_syscall_fd"`
-	UprobeSslShutdown                  *ebpf.Program `ebpf:"uprobe_ssl_shutdown"`
-	UprobeSslWrite                     *ebpf.Program `ebpf:"uprobe_ssl_write"`
-	UprobeSslWriteExSyscallFd          *ebpf.Program `ebpf:"uprobe_ssl_write_ex_syscall_fd"`
-	UprobeSslWriteSyscallFd            *ebpf.Program `ebpf:"uprobe_ssl_write_syscall_fd"`
-	UretprobeSslRead                   *ebpf.Program `ebpf:"uretprobe_ssl_read"`
-	UretprobeSslReadExSyscallFd        *ebpf.Program `ebpf:"uretprobe_ssl_read_ex_syscall_fd"`
-	UretprobeSslReadSyscallFd          *ebpf.Program `ebpf:"uretprobe_ssl_read_syscall_fd"`
-	UretprobeSslWrite                  *ebpf.Program `ebpf:"uretprobe_ssl_write"`
-	UretprobeSslWriteExSyscallFd       *ebpf.Program `ebpf:"uretprobe_ssl_write_ex_syscall_fd"`
-	UretprobeSslWriteSyscallFd         *ebpf.Program `ebpf:"uretprobe_ssl_write_syscall_fd"`
+	KaUprobeClientConnInvoke       *ebpf.Program `ebpf:"ka_uprobe_ClientConn_Invoke"`
+	KaUprobeClientConnNewStream    *ebpf.Program `ebpf:"ka_uprobe_ClientConn_NewStream"`
+	KaUprobeServerHandleStream     *ebpf.Program `ebpf:"ka_uprobe_server_handleStream"`
+	KaUprobeTransportWriteStatus   *ebpf.Program `ebpf:"ka_uprobe_transport_writeStatus"`
+	KaUretprobeClientConnInvoke    *ebpf.Program `ebpf:"ka_uretprobe_ClientConn_Invoke"`
+	KaUretprobeClientStreamRecvMsg *ebpf.Program `ebpf:"ka_uretprobe_clientStream_RecvMsg"`
+	KaUretprobeServerHandleStream  *ebpf.Program `ebpf:"ka_uretprobe_server_handleStream"`
+	KprobeSysClose                 *ebpf.Program `ebpf:"kprobe_sys_close"`
+	KprobeSysConnect               *ebpf.Program `ebpf:"kprobe_sys_connect"`
+	KprobeSysRead                  *ebpf.Program `ebpf:"kprobe_sys_read"`
+	KprobeSysReadv                 *ebpf.Program `ebpf:"kprobe_sys_readv"`
+	KprobeSysRecvfrom              *ebpf.Program `ebpf:"kprobe_sys_recvfrom"`
+	KprobeSysRecvmsg               *ebpf.Program `ebpf:"kprobe_sys_recvmsg"`
+	KprobeSysSendmsg               *ebpf.Program `ebpf:"kprobe_sys_sendmsg"`
+	KprobeSysSendto                *ebpf.Program `ebpf:"kprobe_sys_sendto"`
+	KprobeSysWrite                 *ebpf.Program `ebpf:"kprobe_sys_write"`
+	KprobeSysWritev                *ebpf.Program `ebpf:"kprobe_sys_writev"`
+	KretprobeSysAccept             *ebpf.Program `ebpf:"kretprobe_sys_accept"`
+	KretprobeSysAccept4            *ebpf.Program `ebpf:"kretprobe_sys_accept4"`
+	KretprobeSysConnect            *ebpf.Program `ebpf:"kretprobe_sys_connect"`
+	KretprobeSysRead               *ebpf.Program `ebpf:"kretprobe_sys_read"`
+	KretprobeSysReadv              *ebpf.Program `ebpf:"kretprobe_sys_readv"`
+	KretprobeSysRecvfrom           *ebpf.Program `ebpf:"kretprobe_sys_recvfrom"`
+	KretprobeSysRecvmsg            *ebpf.Program `ebpf:"kretprobe_sys_recvmsg"`
+	TracepointInetSockSetState     *ebpf.Program `ebpf:"tracepoint_inet_sock_set_state"`
+	UprobeSslRead                  *ebpf.Program `ebpf:"uprobe_ssl_read"`
+	UprobeSslWrite                 *ebpf.Program `ebpf:"uprobe_ssl_write"`
+	UretprobeSslRead               *ebpf.Program `ebpf:"uretprobe_ssl_read"`
 }
 
 func (p *apiObserverPrograms) Close() error {
 	return _ApiObserverClose(
 		p.KaUprobeClientConnInvoke,
-		p.KaUprobeClientConnInvokeRetinst,
 		p.KaUprobeClientConnNewStream,
-		p.KaUprobeClientStreamRecvMsgRetinst,
 		p.KaUprobeServerHandleStream,
-		p.KaUprobeServerHandleStreamRetinst,
-		p.KaUprobeTlsConnRead,
-		p.KaUprobeTlsConnReadRetinst,
-		p.KaUprobeTlsConnWrite,
-		p.KaUprobeTlsConnWriteRetinst,
 		p.KaUprobeTransportWriteStatus,
+		p.KaUretprobeClientConnInvoke,
+		p.KaUretprobeClientStreamRecvMsg,
+		p.KaUretprobeServerHandleStream,
 		p.KprobeSysClose,
 		p.KprobeSysConnect,
 		p.KprobeSysRead,
@@ -479,18 +414,8 @@ func (p *apiObserverPrograms) Close() error {
 		p.KretprobeSysRecvmsg,
 		p.TracepointInetSockSetState,
 		p.UprobeSslRead,
-		p.UprobeSslReadExSyscallFd,
-		p.UprobeSslReadSyscallFd,
-		p.UprobeSslShutdown,
 		p.UprobeSslWrite,
-		p.UprobeSslWriteExSyscallFd,
-		p.UprobeSslWriteSyscallFd,
 		p.UretprobeSslRead,
-		p.UretprobeSslReadExSyscallFd,
-		p.UretprobeSslReadSyscallFd,
-		p.UretprobeSslWrite,
-		p.UretprobeSslWriteExSyscallFd,
-		p.UretprobeSslWriteSyscallFd,
 	)
 }
 

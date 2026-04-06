@@ -71,9 +71,22 @@ static __attribute__((always_inline)) int is_health_check(const char *buf, u32 l
   return 0;
 }
 
-// Capture all ports in kernel space for full observability coverage.
-// Fine-grained dropping should be handled in userspace policy/filter stages.
+// TODO: replace to a BPF_MAP_TYPE_HASH lookup.
+// allows us to black list ports and make them configurable in the future
 static __attribute__((always_inline)) int should_trace_port(u16 port) {
-  (void)port;
-  return 1;
+  switch (port) {
+  case 8443:
+  case 6443:
+  case 2379:
+  case 2380:
+  case 10250:
+  case 10255:
+  case 10256:
+  case 9099:
+  case 9100:
+  case 9091:
+    return 0;
+  default:
+    return 1;
+  }
 }
