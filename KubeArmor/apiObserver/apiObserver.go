@@ -5,6 +5,7 @@ package apiobserver
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"io"
@@ -35,8 +36,6 @@ type APIObserver struct {
 	Logger fd.Feeder
 
 	nodeName string
-
-	watcher *Watcher
 
 	// BPF compiled objects and attached probe links.
 	objs  apiObserverObjects
@@ -72,16 +71,6 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 	ao.ctx, ao.cancel = context.WithCancel(context.Background())
 
 	var err error
-	ao.watcher, err = NewWatcher()
-	if err != nil {
-		ao.Logger.Warnf("Failed to create K8s watcher (running without enrichment): %v", err)
-	} else if err = ao.watcher.Start(ao.ctx); err != nil {
-		ao.Logger.Warnf("Failed to start K8s watcher: %v", err)
-		ao.watcher = nil
-	} else {
-		ao.Logger.Print("Kubernetes watcher started successfully")
-	}
-
 	if err = rlimit.RemoveMemlock(); err != nil {
 		ao.Logger.Errf("Error removing rlimit: %v", err)
 		return nil, err
@@ -108,8 +97,6 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 		return nil, err
 	}
 
-
-
 	ao.Events, err = ringbuf.NewReader(ao.objs.ApiobserverEvents)
 	if err != nil {
 		ao.Logger.Errf("Error creating ring buffer reader: %v", err)
@@ -124,7 +111,6 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 	ao.correlator = cor
 	ao.connManager = conn.NewManager(cor, conn.DefaultConfig())
 	ao.Logger.Print("API Observer processing components initialized")
-
 
 	// Start the Go HTTP/2 header events ring buffer.
 	ao.goHeaderEvents, err = ringbuf.NewReader(ao.objs.GoHttp2Events)
@@ -339,6 +325,23 @@ func sanitizeUTF8(s string) string {
 	return strings.ToValidUTF8(s, "")
 }
 
+// sanitizeBody returns a clean body string. If the body contains non-printable
+// bytes (raw protobuf that wasn't decoded), base64-encode it with a prefix
+// so downstream consumers know it's encoded.
+func sanitizeBody(s string) string {
+	if s == "" {
+		return ""
+	}
+	// Check if body has non-printable characters (control chars excluding
+	// tab/newline/carriage-return).
+	for _, b := range []byte(s) {
+		if b < 0x20 && b != '\t' && b != '\n' && b != '\r' {
+			return "[base64]" + base64.StdEncoding.EncodeToString([]byte(s))
+		}
+	}
+	return sanitizeUTF8(s)
+}
+
 func sanitizeHeaders(m map[string]string) map[string]string {
 	if m == nil {
 		return nil
@@ -371,7 +374,12 @@ func (ao *APIObserver) enrichAndEmit(trace *events.CorrelatedTrace, ev *events.D
 	if !ao.filterer.ShouldTraceConnection(srcName, dstName, srcNS, dstNS) {
 		return
 	}
-	if ao.filterer.IsInternalHop(srcName, dstName, srcNS, dstNS) {
+	// Deduplication: both client and server perspectives of the same call
+	// produce events within microseconds. IsDuplicate uses sorted IPs so
+	// both perspectives hash to the same key.
+	if ao.filterer.IsDuplicate(ev.SrcIPString(), ev.DstIPString(),
+		int32(ev.SrcPort), int32(ev.DstPort),
+		trace.Method, trace.URL, trace.Status) {
 		return
 	}
 
@@ -381,7 +389,56 @@ func (ao *APIObserver) enrichAndEmit(trace *events.CorrelatedTrace, ev *events.D
 	}
 
 	// Build pb.APIEvent.
-	latencyNs := uint64(trace.DurationNs)
+	latencyMs := uint32(trace.DurationNs / 1_000_000)
+
+	// Resolve :authority for pseudo-headers.
+	authority := trace.RequestHeaders["host"]
+	if authority == "" {
+		authority = trace.RequestHeaders[":authority"]
+	}
+	if authority == "" {
+		authority = dstName
+	}
+
+	// Ensure method and path are always populated.
+	method := sanitizeUTF8(trace.Method)
+	if method == "" {
+		method = "UNKNOWN"
+	}
+	path := sanitizeUTF8(trace.URL)
+	if path == "" {
+		path = "*"
+	}
+
+	// Build request headers with HTTP/2 pseudo-headers.
+	reqHeaders := sanitizeHeaders(trace.RequestHeaders)
+	if reqHeaders == nil {
+		reqHeaders = make(map[string]string)
+	}
+	reqHeaders[":method"] = method
+	reqHeaders[":path"] = path
+	reqHeaders[":scheme"] = "http"
+
+	if trace.IsEncrypted {
+		reqHeaders[":scheme"] = "https"
+	}
+	reqHeaders[":authority"] = authority
+
+	isGRPC := ev.ProtocolString() == "gRPC" || strings.HasPrefix(trace.ContentType, "application/grpc") || trace.ResponseHeaders["grpc-status"] != "" || trace.GRPCStatus != 0
+
+	if isGRPC {
+		reqHeaders[":scheme"] = "gRPC"
+		if trace.GRPCService != "" {
+			reqHeaders[":authority"] = trace.GRPCService
+		}
+	}
+
+	// Build response headers with :status pseudo-header.
+	respHeaders := sanitizeHeaders(trace.ResponseHeaders)
+	if respHeaders == nil {
+		respHeaders = make(map[string]string)
+	}
+	respHeaders[":status"] = trace.Status
 
 	apiEvent := pb.APIEvent{
 		Metadata: &pb.Metadata{
@@ -402,28 +459,56 @@ func (ao *APIObserver) enrichAndEmit(trace *events.CorrelatedTrace, ev *events.D
 			Port:      int32(ev.DstPort),
 		},
 		Request: &pb.Request{
-			Method:      sanitizeUTF8(trace.Method),
-			Path:        sanitizeUTF8(trace.URL),
-			Headers:     sanitizeHeaders(trace.RequestHeaders),
-			Body:        sanitizeUTF8(trace.RequestBody),
+			Method:      method,
+			Path:        path,
+			Headers:     reqHeaders,
+			Body:        sanitizeBody(trace.RequestBody),
 			GrpcService: sanitizeUTF8(trace.GRPCService),
 			GrpcMethod:  sanitizeUTF8(trace.GRPCMethod),
 			ContentType: sanitizeUTF8(trace.ContentType),
 		},
 		Response: &pb.Response{
 			StatusCode:        statusCode,
-			Headers:           sanitizeHeaders(trace.ResponseHeaders),
-			Body:              sanitizeUTF8(trace.ResponseBody),
+			Headers:           respHeaders,
+			Body:              sanitizeBody(trace.ResponseBody),
 			GrpcStatusCode:    trace.GRPCStatus,
 			GrpcStatusMessage: sanitizeUTF8(trace.GRPCMessage),
 		},
 		Protocol:  ev.ProtocolString(),
-		LatencyNs: latencyNs,
+		LatencyMs: latencyMs,
+	}
+
+	// BUG 5 fix: Override protocol to "gRPC" when content-type or response
+	// headers indicate gRPC traffic, regardless of BPF-level classification.
+	if strings.HasPrefix(trace.ContentType, "application/grpc") ||
+		trace.ResponseHeaders["grpc-status"] != "" {
+		apiEvent.Protocol = "gRPC"
+	}
+
+	// BUG 8 fix: Default grpc-message to "OK" when grpc-status is 0 (success)
+	// and grpc-message is empty. Go gRPC servers omit grpc-message on success.
+	if apiEvent.Response.GrpcStatusCode == 0 && apiEvent.Response.GrpcStatusMessage == "" {
+		if trace.ResponseHeaders["grpc-status"] == "0" || trace.ContentType == "application/grpc" {
+			apiEvent.Response.GrpcStatusMessage = "OK"
+		}
+	}
+
+	// BUG 3 fix: Truncate oversized bodies at the userspace serialization layer.
+	if len(apiEvent.Request.Body) > maxAPIBodyBytes {
+		apiEvent.Request.Body = apiEvent.Request.Body[:maxAPIBodyBytes] + "... [truncated]"
+	}
+	if len(apiEvent.Response.Body) > maxAPIBodyBytes {
+		apiEvent.Response.Body = apiEvent.Response.Body[:maxAPIBodyBytes] + "... [truncated]"
 	}
 
 	// Buffer the event for batched flushing.
 	ao.bufferEvent(&apiEvent)
 }
+
+// maxAPIBodyBytes caps the request/response body size in emitted APIEvents.
+// Bodies exceeding this limit are truncated at the protobuf serialization
+// layer to prevent oversized gRPC messages to downstream consumers.
+const maxAPIBodyBytes = 16384
 
 const eventBufCap = 500
 
@@ -471,18 +556,6 @@ func (ao *APIObserver) flushLoop() {
 // K8s metadata resolution
 
 func (ao *APIObserver) resolveWorkload(ip string) (name, namespace string) {
-	if ao.watcher == nil {
-		return ip, ""
-	}
-	if uri := ao.watcher.GetPodURI(ip); uri != "" {
-		if before, after, ok := strings.Cut(uri, "/"); ok {
-			return after, before
-		}
-		return uri, ""
-	}
-	if svcs := ao.watcher.GetServicesByIP(ip); len(svcs) > 0 {
-		return svcs[0].Name, svcs[0].Namespace
-	}
 	return ip, ""
 }
 
