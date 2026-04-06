@@ -56,6 +56,9 @@ func DefaultOffsetTable() GoOffsetTable {
 	ot.Offsets[GoOffGRPCServerStreamST] = -1
 	ot.Offsets[GoOffGRPCStreamST] = -1
 
+	// crypto/tls.Conn.conn — net.Conn interface at offset 0 (first field).
+	ot.Offsets[GoOffTLSConnConn] = 0
+
 	return ot
 }
 

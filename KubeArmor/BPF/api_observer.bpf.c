@@ -16,15 +16,23 @@
 #include "apiobserver/sock_trace.h"
 #include "apiobserver/openssl_trace.h"
 #include "apiobserver/go_http2_trace.h"
+#include "apiobserver/go_tls_trace.h"
 
 // Go gRPC uprobes — attached to Go gRPC binaries at runtime.
 // Probe implementations are defined inline in go_http2_trace.h using
 // goroutine-based correlation (OTel-style). They capture the gRPC
 // method/path from transport.Stream.Method after HPACK decoding.
 
+// ────────────────────────────────────────────────────────────────
+// SSL Uprobes: Userspace struct offset path (BoringSSL / Netty)
+// ────────────────────────────────────────────────────────────────
 SEC("uprobe/SSL_write")
 int uprobe_ssl_write(struct pt_regs *ctx) {
-    return handle_ssl_write(ctx);
+    return handle_ssl_write_entry(ctx);
+}
+SEC("uretprobe/SSL_write")
+int uretprobe_ssl_write(struct pt_regs *ctx) {
+    return handle_ssl_write_return(ctx);
 }
 SEC("uprobe/SSL_read")
 int uprobe_ssl_read(struct pt_regs *ctx) {
@@ -33,6 +41,54 @@ int uprobe_ssl_read(struct pt_regs *ctx) {
 SEC("uretprobe/SSL_read")
 int uretprobe_ssl_read(struct pt_regs *ctx) {
     return handle_ssl_read_return(ctx);
+}
+
+// ────────────────────────────────────────────────────────────────
+// SSL Uprobes: Nested syscall FD path (OpenSSL / Python / libpython)
+// ────────────────────────────────────────────────────────────────
+SEC("uprobe/SSL_write_syscall_fd")
+int uprobe_ssl_write_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_write_syscall_fd")
+int uretprobe_ssl_write_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_return_syscall_fd(ctx);
+}
+SEC("uprobe/SSL_read_syscall_fd")
+int uprobe_ssl_read_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_read_syscall_fd")
+int uretprobe_ssl_read_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_return_syscall_fd(ctx);
+}
+
+// ────────────────────────────────────────────────────────────────
+// SSL _ex variants: Nested syscall FD path
+// ────────────────────────────────────────────────────────────────
+SEC("uprobe/SSL_write_ex_syscall_fd")
+int uprobe_ssl_write_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_ex_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_write_ex_syscall_fd")
+int uretprobe_ssl_write_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_ex_return_syscall_fd(ctx);
+}
+SEC("uprobe/SSL_read_ex_syscall_fd")
+int uprobe_ssl_read_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_ex_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_read_ex_syscall_fd")
+int uretprobe_ssl_read_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_ex_return_syscall_fd(ctx);
+}
+
+// ────────────────────────────────────────────────────────────────
+// SSL_shutdown — cleanup stash maps
+// ────────────────────────────────────────────────────────────────
+SEC("uprobe/SSL_shutdown")
+int uprobe_ssl_shutdown(struct pt_regs *ctx) {
+    return handle_ssl_shutdown(ctx);
 }
 
 // connection lifecycle

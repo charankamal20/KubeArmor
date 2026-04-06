@@ -115,6 +115,10 @@ type ConnectionTracker struct {
 	// FIX 2: circuit-breaker for repeated parse failures on the same data.
 	parseErrCount int
 
+	// SSL: once any SSL-decrypted event (FLAG_IS_SSL) arrives on this connection,
+	// all subsequent PendingRequests get IsEncrypted=true.
+	isSSL bool
+
 	cfg    TrackerConfig
 	mu     sync.Mutex
 	closed bool
@@ -145,6 +149,13 @@ func (ct *ConnectionTracker) Route(ev *events.DataEvent, cor CorrelatorIface) []
 
 	ct.LastSeen = time.Now()
 	ct.State = ConnActive
+
+	// Track SSL flag: once any SSL-decrypted event arrives, the connection
+	// is permanently marked as SSL. This propagates IsEncrypted into
+	// PendingRequest → CorrelatedTrace → pb.APIEvent (:scheme=https).
+	if ev.IsSSL() {
+		ct.isSSL = true
+	}
 
 	if !ct.directionSet {
 		ct.directionSet = true
@@ -219,6 +230,14 @@ func (ct *ConnectionTracker) detectProtocol() {
 		return
 	}
 
+	// If this looks like TLS (encrypted) and we haven't seen any SSL-decrypted
+	// events for this connection yet, do NOT attempt HTTP protocol detection.
+	// Otherwise we can misclassify ciphertext as HTTP/1 (e.g., random "GET "
+	// tokens in the stream) and flood parse errors / emit garbage events.
+	if !ct.isSSL && isTLSRecordPrefix(buf) {
+		return
+	}
+
 	n := len(http2Preface)
 	if len(buf) >= n {
 		if string(buf[:n]) == http2Preface {
@@ -240,6 +259,25 @@ func (ct *ConnectionTracker) detectProtocol() {
 		ct.Protocol = events.ProtoHTTP1
 		ct.initParsers()
 	}
+}
+
+// isTLSRecordPrefix returns true if buf starts with a TLS record header:
+// [content_type][0x03][version_minor][length_hi][length_lo]
+// content_type is commonly 0x14 (CCS), 0x15 (alert), 0x16 (handshake), 0x17 (app data).
+func isTLSRecordPrefix(buf []byte) bool {
+	if len(buf) < 5 {
+		return false
+	}
+	ct := buf[0]
+	if ct != 0x14 && ct != 0x15 && ct != 0x16 && ct != 0x17 {
+		return false
+	}
+	if buf[1] != 0x03 {
+		return false
+	}
+	// TLS1.0..1.3 are 0x01..0x04. Allow 0x00 defensively for weird stacks.
+	minor := buf[2]
+	return minor <= 0x04
 }
 
 func (ct *ConnectionTracker) initParsers() {
@@ -292,7 +330,7 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		// capture skipBytes (was discarded with _)
 		reqs, consumed, skipBytes, _, err := ct.http1Req.Parse(data)
-		
+
 		if consumed > 0 {
 			ct.parseErrCount = 0
 			ct.sendBuf.Advance(consumed)
@@ -304,13 +342,14 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		for _, req := range reqs {
 			cor.AddHTTP1Request(ct.Key, events.PendingRequest{
-				Timestamp: time.Now(),
-				Method:    req.Method,
-				URL:       req.Path,
-				Headers:   req.Headers,
-				Body:      string(req.Body),
-				Src:       fmt.Sprintf("%s:%d", ev.SrcIPString(), ev.SrcPort),
-				Dst:       fmt.Sprintf("%s:%d", ev.DstIPString(), ev.DstPort),
+				Timestamp:   time.Now(),
+				Method:      req.Method,
+				URL:         req.Path,
+				Headers:     req.Headers,
+				Body:        string(req.Body),
+				Src:         fmt.Sprintf("%s:%d", ev.SrcIPString(), ev.SrcPort),
+				Dst:         fmt.Sprintf("%s:%d", ev.DstIPString(), ev.DstPort),
+				IsEncrypted: ct.isSSL,
 			})
 		}
 
@@ -347,7 +386,7 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		// capture skipBytes (was discarded with _)
 		resps, consumed, skipBytes, _, err := ct.http1Resp.Parse(data)
-		
+
 		if consumed > 0 {
 			ct.parseErrCount = 0
 			ct.recvBuf.Advance(consumed)
@@ -533,6 +572,7 @@ func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface
 				GRPCService: grpcService,
 				GRPCMethod:  grpcMethod,
 				ContentType: contentType,
+				IsEncrypted: ct.isSSL,
 			})
 		} else {
 			// Decode gRPC body through LPM/protobuf parser if applicable.
@@ -689,6 +729,7 @@ func (ct *ConnectionTracker) iterGRPC(ev *events.DataEvent, cor CorrelatorIface)
 				GRPCService: grpcService,
 				GRPCMethod:  grpcMethod,
 				ContentType: contentType,
+				IsEncrypted: ct.isSSL,
 			})
 		} else {
 			// Response: extract grpc-status from trailers and decode body

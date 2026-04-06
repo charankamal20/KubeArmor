@@ -76,6 +76,32 @@ func NewAPIObserverService(running bool) *APIObserverService {
 	}
 }
 
+// Stop terminates all active subscribers and prevents new streams.
+// Called during feeder shutdown to ensure Ctrl+C exits promptly even with active clients.
+func (s *APIObserverService) Stop() {
+	if s == nil {
+		return
+	}
+	s.running = false
+
+	// Copy subscribers under lock, then cancel/close outside the map mutation loop.
+	s.subscribersMu.Lock()
+	subs := make([]*apiEventSubscriber, 0, len(s.subscribers))
+	for _, sub := range s.subscribers {
+		subs = append(subs, sub)
+	}
+	// Clear map so PublishEvent stops fanning out immediately.
+	s.subscribers = make(map[string]*apiEventSubscriber)
+	s.subscribersMu.Unlock()
+
+	for _, sub := range subs {
+		// Idempotent cancellation/close: removeSubscriber expects the sub still in the map,
+		// so perform the minimal shutdown steps here directly.
+		sub.cancel()
+		close(sub.ch)
+	}
+}
+
 func (s *APIObserverService) GetAPIEvents(
 	filter *pb.APIEventFilter,
 	stream grpc.ServerStreamingServer[pb.APIEvent],

@@ -13,31 +13,57 @@
 #include "common/structs.h"
 #include "conn_tracker.h"
 
+/* Portable syscall argument extraction.
+ *
+ * On kernels ≥ 4.17 with syscall wrappers, the kprobe ctx contains a
+ * pointer to the real pt_regs in its first parameter. We dereference
+ * that inner struct to read the actual syscall arguments.
+ *
+ * Register mapping (inner pt_regs fields):
+ *   x86_64: di, si, dx, r10
+ *   arm64:  regs[0], regs[1], regs[2], regs[3]
+ */
 static __always_inline struct pt_regs *get_syscall_regs(struct pt_regs *ctx) {
   return (struct pt_regs *)PT_REGS_PARM1(ctx);
 }
 
 static __always_inline u64 syscall_arg1(struct pt_regs *regs) {
   u64 val = 0;
+#if defined(__TARGET_ARCH_x86)
   bpf_probe_read_kernel(&val, sizeof(val), &regs->di);
+#elif defined(__TARGET_ARCH_arm64)
+  bpf_probe_read_kernel(&val, sizeof(val), &regs->regs[0]);
+#endif
   return val;
 }
 
 static __always_inline u64 syscall_arg2(struct pt_regs *regs) {
   u64 val = 0;
+#if defined(__TARGET_ARCH_x86)
   bpf_probe_read_kernel(&val, sizeof(val), &regs->si);
+#elif defined(__TARGET_ARCH_arm64)
+  bpf_probe_read_kernel(&val, sizeof(val), &regs->regs[1]);
+#endif
   return val;
 }
 
 static __always_inline u64 syscall_arg3(struct pt_regs *regs) {
   u64 val = 0;
+#if defined(__TARGET_ARCH_x86)
   bpf_probe_read_kernel(&val, sizeof(val), &regs->dx);
+#elif defined(__TARGET_ARCH_arm64)
+  bpf_probe_read_kernel(&val, sizeof(val), &regs->regs[2]);
+#endif
   return val;
 }
 
 static __always_inline u64 syscall_arg4(struct pt_regs *regs) {
   u64 val = 0;
+#if defined(__TARGET_ARCH_x86)
   bpf_probe_read_kernel(&val, sizeof(val), &regs->r10);
+#elif defined(__TARGET_ARCH_arm64)
+  bpf_probe_read_kernel(&val, sizeof(val), &regs->regs[3]);
+#endif
   return val;
 }
 
@@ -74,12 +100,54 @@ static __always_inline void *read_msghdr_iov(const void *msg_ptr) {
 }
 
 /* 
+ * propagate_fd_to_ssl_call — nested syscall FD detection bridge.
+ *
+ * If SSL_read/SSL_write is on the stack for this thread, the SSL uprobe
+ * entry has placed an entry in ssl_user_space_call_map. When the underlying
+ * read()/write() syscall fires, we capture the FD here so the SSL return
+ * probe can retrieve it. (Pixie's approach from socket_trace.c L188-203.)
+ */
+static __always_inline void propagate_fd_to_ssl_call(u32 fd) {
+  u64 pid_tgid = bpf_get_current_pid_tgid();
+  struct nested_syscall_fd_t *nsc =
+      bpf_map_lookup_elem(&ssl_user_space_call_map, &pid_tgid);
+  if (nsc != NULL) {
+    if (nsc->fd == INVALID_FD) {
+      nsc->fd = (s32)fd;
+    } else if (nsc->fd != (s32)fd) {
+      /* Multiple different FDs during one SSL call — flag it */
+      nsc->mismatched_fds = 1;
+    }
+    /* mark_conn_as_ssl is called later in the SSL return probe's emit path */
+  }
+}
+
+/* 
  * Common egress helper — used by write, writev, sendto, sendmsg
  *
  * All egress handlers resolve FD, read payload from user buffer, and emit.
  *  */
 static __always_inline int egress_submit(u32 fd, const void *buf, u32 count) {
   if (!buf || count == 0)
+    return 0;
+
+  /* Bridge FD to active SSL call if one is on the stack */
+  propagate_fd_to_ssl_call(fd);
+
+  /* Early suppression for Go TLS: if crypto/tls.(*Conn).Read/Write is active
+   * on this thread, skip emitting the encrypted syscall payload. The Go TLS
+   * retinst uprobe will emit decrypted plaintext instead. */
+  u64 pid_tgid_tls = bpf_get_current_pid_tgid();
+  if (bpf_map_lookup_elem(&go_tls_user_space_call_map, &pid_tgid_tls) != NULL)
+    return 0;
+
+  /* Early suppression: if this syscall is nested inside an SSL_write/SSL_read
+   * call (ssl_user_space_call_map has an entry), skip emitting the encrypted
+   * data. The SSL return probe will emit the decrypted plaintext instead.
+   * Without this, the first SSL call's encrypted data floods the buffer
+   * before is_ssl is set (race window). */
+  u64 pid_tgid_ssl = bpf_get_current_pid_tgid();
+  if (bpf_map_lookup_elem(&ssl_user_space_call_map, &pid_tgid_ssl) != NULL)
     return 0;
 
   u64 sock_ptr = resolve_fd_to_sock_ptr(fd);
@@ -119,6 +187,20 @@ static __always_inline int ingress_entry(u32 fd, const void *buf) {
   if (!buf)
     return 0;
 
+  /* Bridge FD to active SSL call if one is on the stack */
+  propagate_fd_to_ssl_call(fd);
+
+  /* Early suppression for Go TLS (see egress_submit). */
+  u64 pid_tgid_tls = bpf_get_current_pid_tgid();
+  if (bpf_map_lookup_elem(&go_tls_user_space_call_map, &pid_tgid_tls) != NULL)
+    return 0;
+
+  /* Early suppression: if nested inside an SSL call, don't save the encrypted
+   * buffer — the SSL return probe handles the decrypted plaintext. */
+  u64 pid_tgid_ssl = bpf_get_current_pid_tgid();
+  if (bpf_map_lookup_elem(&ssl_user_space_call_map, &pid_tgid_ssl) != NULL)
+    return 0;
+
   u64 sock_ptr = resolve_fd_to_sock_ptr(fd);
   if (sock_ptr == 0)
     return 0;
@@ -138,6 +220,18 @@ static __always_inline int ingress_return(struct pt_regs *ctx) {
   struct data_args *args = bpf_map_lookup_elem(&active_data_args, &pid_tgid);
   if (!args)
     return 0;
+
+  /* Safety net: if Go TLS is active on this thread, don't emit encrypted data. */
+  if (bpf_map_lookup_elem(&go_tls_user_space_call_map, &pid_tgid) != NULL) {
+    bpf_map_delete_elem(&active_data_args, &pid_tgid);
+    return 0;
+  }
+
+  /* Safety net: if an SSL call is on the stack, don't emit encrypted data */
+  if (bpf_map_lookup_elem(&ssl_user_space_call_map, &pid_tgid) != NULL) {
+    bpf_map_delete_elem(&active_data_args, &pid_tgid);
+    return 0;
+  }
 
   u32 fd = args->fd;
   void *buf = (void *)args->buf;

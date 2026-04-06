@@ -41,6 +41,13 @@ static __attribute__((always_inline)) void update_stats(u8 protocol,
     return;
   }
 
+  /* Explicit bounds check so the BPF verifier can bound the compiler's
+   * jump-table offset to at most PROTO_GRPC (3), preventing an
+   * "invalid access to map value, value_size=56 off=256" rejection. */
+  if (protocol < PROTO_HTTP1 || protocol > PROTO_GRPC) {
+    return;
+  }
+
   switch (protocol) {
   case PROTO_HTTP1:
     __sync_fetch_and_add(&s->http1_packets, 1);
@@ -237,11 +244,15 @@ handle_inet_sock_set_state(struct inet_sock_set_state_args *ctx) {
 static __attribute__((always_inline)) int
 handle_connect_entry(struct pt_regs *ctx) {
   u64 pid_tgid = bpf_get_current_pid_tgid();
-  // On x86_64 with syscall wrappers, PT_REGS_PARM1 gives the inner
+  // On kernels >= 4.17 with syscall wrappers, PT_REGS_PARM1 gives the inner
   // pt_regs pointer.
   struct pt_regs *regs = (struct pt_regs *)PT_REGS_PARM1(ctx);
   u64 fd_val = 0;
+#if defined(__TARGET_ARCH_x86)
   bpf_probe_read_kernel(&fd_val, sizeof(fd_val), &regs->di);
+#elif defined(__TARGET_ARCH_arm64)
+  bpf_probe_read_kernel(&fd_val, sizeof(fd_val), &regs->regs[0]);
+#endif
   struct connect_args args = {.fd = (u32)fd_val};
   bpf_map_update_elem(&active_connect_args, &pid_tgid, &args, BPF_ANY);
   return 0;
@@ -304,7 +315,11 @@ handle_close_entry(struct pt_regs *ctx) {
 
   struct pt_regs *regs = (struct pt_regs *)PT_REGS_PARM1(ctx);
   u64 fd_val = 0;
+#if defined(__TARGET_ARCH_x86)
   bpf_probe_read_kernel(&fd_val, sizeof(fd_val), &regs->di);
+#elif defined(__TARGET_ARCH_arm64)
+  bpf_probe_read_kernel(&fd_val, sizeof(fd_val), &regs->regs[0]);
+#endif
   u32 fd = (u32)fd_val;
   struct conn_id cid = {.tgid = (u32)(pid_tgid >> 32), .fd = fd};
 
