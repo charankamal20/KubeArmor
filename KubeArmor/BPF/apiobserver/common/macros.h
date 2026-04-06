@@ -34,9 +34,6 @@
 #define FLAG_TRUNCATED 0x02
 
 // Payload size limit, used by the ring buffer
-// Payload size limit per BPF event. Increasing beyond 8192 causes BPF
-// verifier failures on some kernels (map value offset tracking).
-// Userspace truncation in enrichAndEmit provides an additional safety cap.
 #define MAX_DATA_SIZE 8192
 
 // BPF loop limits

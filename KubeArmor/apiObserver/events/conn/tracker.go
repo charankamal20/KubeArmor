@@ -8,7 +8,6 @@ package conn
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -105,12 +104,6 @@ type ConnectionTracker struct {
 
 	isClientSide bool
 	directionSet bool
-
-	// Per-connection gRPC protocol memory (OpenTelemetry pattern).
-	// Once any stream on this connection is identified as gRPC
-	// (via content-type header or grpc-status trailer), all
-	// subsequent streams inherit the gRPC classification.
-	detectedGRPC bool
 
 	// FIX 2: circuit-breaker for repeated parse failures on the same data.
 	parseErrCount int
@@ -316,14 +309,10 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		if err != nil {
 			ct.parseErrCount++
-			// BUG 2 fix: rate-limit parse error logs — emit on 1st
-			// and every 10th consecutive error to reduce flooding.
-			if ct.parseErrCount == 1 || ct.parseErrCount%10 == 0 {
-				slog.Debug("HTTP/1 request parse error",
-					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr),
-					"err", err,
-					"consecutive", ct.parseErrCount)
-			}
+			slog.Debug("HTTP/1 request parse error",
+				"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr),
+				"err", err,
+				"consecutive", ct.parseErrCount)
 			if ct.parseErrCount >= maxConsecutiveParseErrors {
 				slog.Warn("HTTP/1: too many consecutive parse errors, resetting buffer",
 					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
@@ -375,13 +364,10 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		if err != nil {
 			ct.parseErrCount++
-			// BUG 2 fix: rate-limit parse error logs.
-			if ct.parseErrCount == 1 || ct.parseErrCount%10 == 0 {
-				slog.Debug("HTTP/1 response parse error",
-					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr),
-					"err", err,
-					"consecutive", ct.parseErrCount)
-			}
+			slog.Debug("HTTP/1 response parse error",
+				"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr),
+				"err", err,
+				"consecutive", ct.parseErrCount)
 			if ct.parseErrCount >= maxConsecutiveParseErrors {
 				slog.Warn("HTTP/1: too many consecutive parse errors, resetting buffer",
 					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
@@ -410,29 +396,6 @@ func isHTTP1RequestPrefix(buf []byte) bool {
 		}
 	}
 	return false
-}
-
-// isLikelyGRPCBody returns true if body starts with a valid gRPC Length-Prefixed
-// Message (LPM) header: [1-byte compressed flag (0|1)][4-byte BE length].
-// This heuristic is used when content-type is missing from HPACK due to
-// dynamic table invisibility on mid-stream connections.
-func isLikelyGRPCBody(body []byte) bool {
-	if len(body) < 5 {
-		return false
-	}
-	// Compressed flag must be 0 or 1.
-	if body[0] > 1 {
-		return false
-	}
-	// Payload length from 4-byte big-endian.
-	payloadLen := binary.BigEndian.Uint32(body[1:5])
-	// Length must be plausible: non-zero and not exceed remaining body.
-	if payloadLen == 0 || payloadLen > 16*1024*1024 {
-		return false
-	}
-	// The full message should be at most payloadLen + 5 bytes.
-	// Allow truncated bodies where we have less than the full payload.
-	return true
 }
 
 // iterHTTP2 extracts HTTP/2 frames, identifies request/response by stream ID,
@@ -483,26 +446,6 @@ func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface
 		}
 		isGRPCContent := grpc.IsGRPCContentType(contentType)
 
-		// Heuristic gRPC detection when content-type is missing
-		// (HPACK dynamic table miss). Modeled after OpenTelemetry.
-		if !isGRPCContent {
-			if ct.detectedGRPC {
-				// Connection already identified as gRPC.
-				isGRPCContent = true
-				contentType = "application/grpc"
-			} else if msg.Method == "POST" && isLikelyGRPCBody(msg.Body) {
-				// LPM body heuristic: body starts with valid gRPC frame.
-				isGRPCContent = true
-				contentType = "application/grpc"
-				ct.detectedGRPC = true
-				slog.Debug("gRPC detected by body heuristic",
-					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
-			}
-		} else {
-			// Explicit content-type seen — remember for future streams.
-			ct.detectedGRPC = true
-		}
-
 		if isRequest {
 			// Decode gRPC body through LPM/protobuf parser if applicable.
 			body := string(msg.Body)
@@ -511,9 +454,6 @@ func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface
 				if parseErr == nil && grpcMsg != nil {
 					body = grpcMsg.Body
 				}
-			}
-			if msg.BodyTruncated {
-				body += fmt.Sprintf(" ... [truncated, original=%dB]", msg.OriginalBodySize)
 			}
 
 			var grpcService, grpcMethod string
@@ -543,24 +483,12 @@ func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface
 					body = grpcMsg.Body
 				}
 			}
-			if msg.BodyTruncated {
-				body += fmt.Sprintf(" ... [truncated, original=%dB]", msg.OriginalBodySize)
-			}
 
 			// Extract gRPC status from trailers if present.
 			status := msg.Status
 			var grpcStatusCode int32
 			var grpcMessage string
 			if isGRPCContent {
-				grpcStatusCode, grpcMessage, _ = ct.gRPC.ParseTrailers(msg.Headers)
-				if status == "" {
-					status = fmt.Sprintf("%d", grpcStatusCode)
-				}
-			} else if _, hasGRPCStatus := msg.Headers["grpc-status"]; hasGRPCStatus {
-				// grpc-status in trailers but content-type was missed.
-				ct.detectedGRPC = true
-				isGRPCContent = true
-				contentType = "application/grpc"
 				grpcStatusCode, grpcMessage, _ = ct.gRPC.ParseTrailers(msg.Headers)
 				if status == "" {
 					status = fmt.Sprintf("%d", grpcStatusCode)
@@ -580,13 +508,6 @@ func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface
 					trace.GRPCStatus = grpcStatusCode
 					trace.GRPCMessage = grpcMessage
 					trace.ContentType = contentType
-					// BUG 4 fix: If grpc-status was not in the message
-					// headers (trailing HEADERS segment missed by BPF),
-					// default to 0 (OK) for responses that have body data.
-					if _, hasStatus := msg.Headers["grpc-status"]; !hasStatus && len(msg.Body) > 0 {
-						trace.GRPCStatus = 0
-						trace.GRPCMessage = "OK"
-					}
 				}
 				out = append(out, trace)
 			}
@@ -644,20 +565,6 @@ func (ct *ConnectionTracker) iterGRPC(ev *events.DataEvent, cor CorrelatorIface)
 		}
 		isGRPC := grpc.IsGRPCContentType(contentType)
 
-		// Heuristic gRPC detection (same as iterHTTP2).
-		if !isGRPC {
-			if ct.detectedGRPC {
-				isGRPC = true
-				contentType = "application/grpc"
-			} else if msg.Method == "POST" && isLikelyGRPCBody(msg.Body) {
-				isGRPC = true
-				contentType = "application/grpc"
-				ct.detectedGRPC = true
-			}
-		} else {
-			ct.detectedGRPC = true
-		}
-
 		if isRequest {
 			// Extract service/method from :path for gRPC
 			var grpcService, grpcMethod string
@@ -672,9 +579,6 @@ func (ct *ConnectionTracker) iterGRPC(ev *events.DataEvent, cor CorrelatorIface)
 				if parseErr == nil && grpcMsg != nil {
 					body = grpcMsg.Body
 				}
-			}
-			if msg.BodyTruncated {
-				body += fmt.Sprintf(" ... [truncated, original=%dB]", msg.OriginalBodySize)
 			}
 
 			cor.AddHTTP2Request(ct.Key, msg.StreamID, events.PendingRequest{
@@ -703,15 +607,6 @@ func (ct *ConnectionTracker) iterGRPC(ev *events.DataEvent, cor CorrelatorIface)
 				if status == "" {
 					status = fmt.Sprintf("%d", grpcStatusCode)
 				}
-			} else if _, hasGRPCStatus := msg.Headers["grpc-status"]; hasGRPCStatus {
-				// grpc-status in trailers but content-type was missed.
-				ct.detectedGRPC = true
-				isGRPC = true
-				contentType = "application/grpc"
-				grpcStatusCode, grpcMessage, _ = ct.gRPC.ParseTrailers(msg.Headers)
-				if status == "" {
-					status = fmt.Sprintf("%d", grpcStatusCode)
-				}
 			}
 
 			body := string(msg.Body)
@@ -720,9 +615,6 @@ func (ct *ConnectionTracker) iterGRPC(ev *events.DataEvent, cor CorrelatorIface)
 				if parseErr == nil && grpcMsg != nil {
 					body = grpcMsg.Body
 				}
-			}
-			if msg.BodyTruncated {
-				body += fmt.Sprintf(" ... [truncated, original=%dB]", msg.OriginalBodySize)
 			}
 
 			trace := cor.MatchHTTP2Response(
@@ -738,13 +630,6 @@ func (ct *ConnectionTracker) iterGRPC(ev *events.DataEvent, cor CorrelatorIface)
 				trace.GRPCStatus = grpcStatusCode
 				trace.GRPCMessage = grpcMessage
 				trace.ContentType = contentType
-				// BUG 4 fix: If grpc-status was not in the message
-				// headers (trailing HEADERS segment missed by BPF),
-				// default to 0 (OK) for responses that have body data.
-				if _, hasStatus := msg.Headers["grpc-status"]; !hasStatus && len(msg.Body) > 0 {
-					trace.GRPCStatus = 0
-					trace.GRPCMessage = "OK"
-				}
 				out = append(out, trace)
 			}
 		}

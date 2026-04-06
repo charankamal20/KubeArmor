@@ -55,11 +55,6 @@ func (fh *FrameHeader) IsEndHeaders() bool {
 	return fh.Flags&FlagHeadersEndHeaders != 0
 }
 
-// maxBodyBytes caps the body bytes accumulated per HTTP/2 stream.
-// Modeled after Pixie's HalfStream::AddData (kMaxBodyBytes = 512).
-// We use 4KB for richer schemaless protobuf decoding.
-const maxBodyBytes = 4096
-
 // Message is one complete HTTP/2 stream message (request or response).
 // Aggregated from HEADERS + DATA + optional TRAILERS frames.
 type Message struct {
@@ -77,9 +72,7 @@ type Message struct {
 	ContentType string
 
 	// Aggregated DATA frame payload.
-	Body             []byte
-	BodyTruncated    bool // true if body was capped at maxBodyBytes
-	OriginalBodySize int  // total bytes received before truncation
+	Body []byte
 }
 
 // StreamState tracks one HTTP/2 stream's accumulated headers and body.
@@ -155,10 +148,7 @@ func (p *Parser) ParseFrames(data []byte) ([]*Message, []byte, error) {
 			StreamID: binary.BigEndian.Uint32(data[offset+5:offset+9]) & 0x7FFFFFFF,
 		}
 
-		// BUG 6 fix: Validate frame type is known (0x00–0x09). Unknown
-		// type with a plausible length could be misaligned data from a
-		// segment boundary, leading to payload leakage.
-		if fh.Length > p.maxFrameSize || fh.Type > FrameTypeContinuation {
+		if fh.Length > p.maxFrameSize {
 			offset++
 			continue
 		}
@@ -294,20 +284,7 @@ func (p *Parser) handleData(fh *FrameHeader, payload []byte) (*Message, error) {
 	}
 	stream.mu.Lock()
 	defer stream.mu.Unlock()
-	// Track total body size before any truncation.
-	stream.Message.OriginalBodySize += len(bodyData)
-	// Pixie-style body cap: only accumulate up to maxBodyBytes.
-	if len(stream.Message.Body) < maxBodyBytes {
-		remaining := maxBodyBytes - len(stream.Message.Body)
-		if len(bodyData) > remaining {
-			stream.Message.Body = append(stream.Message.Body, bodyData[:remaining]...)
-			stream.Message.BodyTruncated = true
-		} else {
-			stream.Message.Body = append(stream.Message.Body, bodyData...)
-		}
-	} else {
-		stream.Message.BodyTruncated = true
-	}
+	stream.Message.Body = append(stream.Message.Body, bodyData...)
 	if fh.IsEndStream() {
 		stream.Message.IsEndStream = true
 		stream.IsComplete = true
