@@ -44,8 +44,9 @@ static __attribute__((always_inline)) void update_stats(u8 protocol,
   // Explicit bounds check so the BPF verifier can bound the compiler's
   // jump-table offset to at most PROTO_GRPC (3), preventing an
   // "invalid access to map value, value_size=56 off=256" rejection.
-  if (protocol < PROTO_HTTP1 || protocol > PROTO_GRPC)
+  if (protocol < PROTO_HTTP1 || protocol > PROTO_GRPC) {
     return;
+  }
 
   switch (protocol) {
   case PROTO_HTTP1:
