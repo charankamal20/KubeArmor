@@ -16,6 +16,7 @@
 #include "apiobserver/sock_trace.h"
 #include "apiobserver/openssl_trace.h"
 #include "apiobserver/go_http2_trace.h"
+#include "apiobserver/grpc_c_trace.h"
 
 // Go gRPC uprobes — attached to Go gRPC binaries at runtime.
 // Probe implementations are defined inline in go_http2_trace.h using
@@ -33,6 +34,13 @@ int uprobe_ssl_read(struct pt_regs *ctx) {
 SEC("uretprobe/SSL_read")
 int uretprobe_ssl_read(struct pt_regs *ctx) {
     return handle_ssl_read_return(ctx);
+}
+
+// gRPC-C uprobes — attached to libgrpc.so at runtime for Python/C++/Ruby/PHP/C# services.
+// Captures grpc_chttp2_stream.method directly from process memory, bypassing the HPACK
+SEC("uprobe/grpc_chttp2_maybe_complete_recv_initial_metadata")
+int ka_uprobe_grpc_c_recv_initial_metadata_entry(struct pt_regs *ctx) {
+    return handle_grpc_c_recv_initial_metadata(ctx);  
 }
 
 // connection lifecycle

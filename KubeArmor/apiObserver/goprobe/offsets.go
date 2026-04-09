@@ -42,10 +42,10 @@ func DefaultOffsetTable() GoOffsetTable {
 	ot.Offsets[GoOffGRPCStatusCode] = 0
 
 	// FD offsets (not used by goroutine-based probes, but populated for potential future use).
-	ot.Offsets[GoOffFDSysfd] = 16  // internal/poll.FD.Sysfd
-	ot.Offsets[GoOffConnFD] = 16   // net.conn.fd
-	ot.Offsets[GoOffFDLaddr] = 32  // netFD.laddr
-	ot.Offsets[GoOffFDRaddr] = 48  // netFD.raddr
+	ot.Offsets[GoOffFDSysfd] = 16 // internal/poll.FD.Sysfd
+	ot.Offsets[GoOffConnFD] = 16  // net.conn.fd
+	ot.Offsets[GoOffFDLaddr] = 32 // netFD.laddr
+	ot.Offsets[GoOffFDRaddr] = 48 // netFD.raddr
 	ot.Offsets[GoOffTCPAddrPort] = 16
 	ot.Offsets[GoOffTCPAddrIP] = 0
 
@@ -55,6 +55,7 @@ func DefaultOffsetTable() GoOffsetTable {
 	ot.Offsets[GoOffGRPCServerStreamStream] = -1
 	ot.Offsets[GoOffGRPCServerStreamST] = -1
 	ot.Offsets[GoOffGRPCStreamST] = -1
+	ot.Offsets[GoOffTLSConnConn] = -1
 
 	return ot
 }
@@ -83,7 +84,7 @@ func ApplyVersionOffsets(ot *GoOffsetTable, version string) {
 	}
 
 	// gRPC >= 1.77: Further Server stream reorganization.
-	// (Adjust offsets when support is added.)
+	// offsets will be adjusted when support is added
 }
 
 // versionGE does a simple lexicographic comparison of Go module version strings.
@@ -117,11 +118,11 @@ func DefaultCommonSymaddrs() GoCommonSymaddrs {
 	return GoCommonSymaddrs{
 		InternalSyscallConn:   -1,
 		TlsConn:               -1,
-		NetTCPConn:             -1,
-		FD_SysfdOffset:         16,
-		TlsConnConnOffset:      0,
-		SyscallConnConnOffset:  8,
-		G_goidOffset:           152,
-		G_addrOffset:           -8,
+		NetTCPConn:            -1,
+		FD_SysfdOffset:        16,
+		TlsConnConnOffset:     0,
+		SyscallConnConnOffset: 8,
+		G_goidOffset:          152,
+		G_addrOffset:          -8,
 	}
 }

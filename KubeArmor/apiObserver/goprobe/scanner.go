@@ -38,23 +38,24 @@ var InvalidLoc = ArgLocation{Type: LocInvalid, Offset: -1}
 
 // Offset table indices — must match go_http2_symaddrs.h enum go_offset_kind.
 const (
-	GoOffGRPCStreamMethod      = 0
-	GoOffGRPCStreamID          = 1
-	GoOffGRPCTransportConn     = 2
-	GoOffGRPCStatusS           = 3
-	GoOffGRPCStatusCode        = 4
-	GoOffFDSysfd               = 5
-	GoOffConnFD                = 6
-	GoOffFDLaddr               = 7
-	GoOffFDRaddr               = 8
-	GoOffTCPAddrPort           = 9
-	GoOffTCPAddrIP             = 10
-	GoOffGRPCV160              = 11
-	GoOffGRPCV169              = 12
+	GoOffGRPCStreamMethod       = 0
+	GoOffGRPCStreamID           = 1
+	GoOffGRPCTransportConn      = 2
+	GoOffGRPCStatusS            = 3
+	GoOffGRPCStatusCode         = 4
+	GoOffFDSysfd                = 5
+	GoOffConnFD                 = 6
+	GoOffFDLaddr                = 7
+	GoOffFDRaddr                = 8
+	GoOffTCPAddrPort            = 9
+	GoOffTCPAddrIP              = 10
+	GoOffGRPCV160               = 11
+	GoOffGRPCV169               = 12
 	GoOffGRPCServerStreamStream = 13
-	GoOffGRPCServerStreamST    = 14
-	GoOffGRPCStreamST          = 15
-	GoOffMax                   = 16
+	GoOffGRPCServerStreamST     = 14
+	GoOffGRPCStreamST           = 15
+	GoOffTLSConnConn            = 16 
+	GoOffMax                    = 17 
 )
 
 // GoOffsetTable matches BPF struct go_offset_table.
@@ -68,12 +69,12 @@ type GoOffsetTable struct {
 type GoCommonSymaddrs struct {
 	InternalSyscallConn   int64
 	TlsConn               int64
-	NetTCPConn             int64
-	FD_SysfdOffset         int32
-	TlsConnConnOffset      int32
-	SyscallConnConnOffset  int32
-	G_goidOffset           int32
-	G_addrOffset           int32
+	NetTCPConn            int64
+	FD_SysfdOffset        int32
+	TlsConnConnOffset     int32
+	SyscallConnConnOffset int32
+	G_goidOffset          int32
+	G_addrOffset          int32
 }
 
 // GoUProbeTarget is a Go binary that has gRPC / HTTP/2 symbols.
@@ -330,7 +331,6 @@ func resolveItableAddrs(ef *elf.File, common *GoCommonSymaddrs) {
 		}
 	}
 }
-
 
 // FindGoHTTP2PIDs returns PIDs of processes using Go gRPC/HTTP2.
 // Useful for targeted scanning instead of full /proc scan.

@@ -19,9 +19,9 @@
 
 #pragma once
 
-#include "go_types.h"
-#include "go_http2_symaddrs.h"
 #include "common/macros.h"
+#include "go_http2_symaddrs.h"
+#include "go_types.h"
 
 /* ---- Constants ---- */
 #define GRPC_MAX_PATH_SIZE 160
@@ -56,8 +56,8 @@ struct go_grpc_request_event {
   u64 end_ns;
   u32 pid;
   u16 status;
-  u8  event_type;  /* go_grpc_event_type */
-  u8  _pad;
+  u8 event_type; /* go_grpc_event_type */
+  u8 _pad;
   char path[GRPC_MAX_PATH_SIZE];
 };
 
@@ -132,7 +132,8 @@ static __always_inline struct go_offset_table *get_offsets(void) {
   return (struct go_offset_table *)bpf_map_lookup_elem(&go_offsets_map, &ino);
 }
 
-static __always_inline s64 go_offset(struct go_offset_table *ot, enum go_offset_kind kind) {
+static __always_inline s64 go_offset(struct go_offset_table *ot,
+                                     enum go_offset_kind kind) {
   if (!ot || kind >= GO_OFF_MAX)
     return -1;
   return ot->offsets[kind];
@@ -144,14 +145,15 @@ static __always_inline s64 go_offset(struct go_offset_table *ot, enum go_offset_
  * then read up to max_size bytes from the pointer.
  * Returns 1 on success, 0 on failure.
  */
-static __always_inline int read_go_str(void *base_ptr, s64 offset,
-                                        char *dst, u64 max_size) {
+static __always_inline int read_go_str(void *base_ptr, s64 offset, char *dst,
+                                       u64 max_size) {
   void *str_ptr = NULL;
   u64 str_len = 0;
 
   if (bpf_probe_read_user(&str_ptr, sizeof(str_ptr), base_ptr + offset) != 0)
     return 0;
-  if (bpf_probe_read_user(&str_len, sizeof(str_len), base_ptr + offset + 8) != 0)
+  if (bpf_probe_read_user(&str_len, sizeof(str_len), base_ptr + offset + 8) !=
+      0)
     return 0;
   if (!str_ptr || str_len == 0)
     return 0;
@@ -171,8 +173,8 @@ static __always_inline int read_go_str(void *base_ptr, s64 offset,
  * Read a Go string directly from a pointer + length.
  * Used for client-side method reading where we have ptr and len from registers.
  */
-static __always_inline int read_go_str_n(void *ptr, u64 len,
-                                          char *dst, u64 max_size) {
+static __always_inline int read_go_str_n(void *ptr, u64 len, char *dst,
+                                         u64 max_size) {
   if (!ptr || len == 0)
     return 0;
 
@@ -240,9 +242,11 @@ int ka_uretprobe_server_handleStream(struct pt_regs *ctx) {
   go_addr_key_init(&g_key, goroutine_addr);
 
   struct go_grpc_server_invocation *invocation =
-    bpf_map_lookup_elem(&ongoing_grpc_server_requests, &g_key);
+      bpf_map_lookup_elem(&ongoing_grpc_server_requests, &g_key);
   if (!invocation) {
-    bpf_printk("ka_uretprobe: server_handleStream no invocation for goroutine=%lx", goroutine_addr);
+    bpf_printk(
+        "ka_uretprobe: server_handleStream no invocation for goroutine=%lx",
+        goroutine_addr);
     goto done;
   }
 
@@ -265,8 +269,8 @@ int ka_uretprobe_server_handleStream(struct pt_regs *ctx) {
     status = *status_ptr;
 
   /* Reserve ring buffer space */
-  struct go_grpc_request_event *event =
-    bpf_ringbuf_reserve(&go_http2_events, sizeof(struct go_grpc_request_event), 0);
+  struct go_grpc_request_event *event = bpf_ringbuf_reserve(
+      &go_http2_events, sizeof(struct go_grpc_request_event), 0);
   if (!event) {
     bpf_printk("ka_uretprobe: ring buffer full");
     goto done;
@@ -281,14 +285,16 @@ int ka_uretprobe_server_handleStream(struct pt_regs *ctx) {
 
   /* Read Stream.Method → path */
   void *stream_ptr = (void *)invocation->stream_ptr;
-  if (!read_go_str(stream_ptr, method_offset, event->path, GRPC_MAX_PATH_SIZE)) {
-    bpf_printk("ka_uretprobe: can't read Stream.Method at offset %d", method_offset);
+  if (!read_go_str(stream_ptr, method_offset, event->path,
+                   GRPC_MAX_PATH_SIZE)) {
+    bpf_printk("ka_uretprobe: can't read Stream.Method at offset %d",
+               method_offset);
     bpf_ringbuf_discard(event, 0);
     goto done;
   }
 
-  bpf_printk("ka_uretprobe: server path=%s latency=%llu ns",
-             event->path, event->end_ns - event->start_ns);
+  bpf_printk("ka_uretprobe: server path=%s latency=%llu ns", event->path,
+             event->end_ns - event->start_ns);
 
   bpf_ringbuf_submit(event, 0);
 
@@ -303,8 +309,8 @@ done:
  * Captures the gRPC response status code.
  *
  * Adapted from OTel's transport_writeStatus probe.
- * Signature: func (t *http2Server) WriteStatus(s *Stream, st *status.Status) error
- * In register ABI: receiver=rax, s=rbx, st=rcx
+ * Signature: func (t *http2Server) WriteStatus(s *Stream, st *status.Status)
+ * error In register ABI: receiver=rax, s=rbx, st=rcx
  */
 SEC("uprobe/transport_writeStatus")
 int ka_uprobe_transport_writeStatus(struct pt_regs *ctx) {
@@ -333,9 +339,11 @@ int ka_uprobe_transport_writeStatus(struct pt_regs *ctx) {
   u16 status_code = 0;
   bpf_probe_read_user(&status_code, sizeof(status_code), s_ptr + code_offset);
 
-  bpf_printk("ka_uprobe: writeStatus goroutine=%lx status=%d", goroutine_addr, status_code);
+  bpf_printk("ka_uprobe: writeStatus goroutine=%lx status=%d", goroutine_addr,
+             status_code);
 
-  bpf_map_update_elem(&ongoing_grpc_request_status, &g_key, &status_code, BPF_ANY);
+  bpf_map_update_elem(&ongoing_grpc_request_status, &g_key, &status_code,
+                      BPF_ANY);
   return 0;
 }
 
@@ -344,8 +352,9 @@ int ka_uprobe_transport_writeStatus(struct pt_regs *ctx) {
  * Entry point for unary client gRPC calls.
  *
  * Signature: func (cc *ClientConn) Invoke(ctx context.Context, method string,
- *                                          args, reply interface{}, opts ...CallOption) error
- * Register ABI: cc=rax, ctx.type=rbx, ctx.data=rcx, method.ptr=rdi, method.len=rsi
+ *                                          args, reply interface{}, opts
+ * ...CallOption) error Register ABI: cc=rax, ctx.type=rbx, ctx.data=rcx,
+ * method.ptr=rdi, method.len=rsi
  */
 SEC("uprobe/ClientConn_Invoke")
 int ka_uprobe_ClientConn_Invoke(struct pt_regs *ctx) {
@@ -356,16 +365,18 @@ int ka_uprobe_ClientConn_Invoke(struct pt_regs *ctx) {
   void *method_ptr = GO_PARAM4(ctx);
   void *method_len = GO_PARAM5(ctx);
 
-  bpf_printk("ka_uprobe: ClientConn_Invoke goroutine=%lx method_ptr=%lx len=%lx",
-             goroutine_addr, method_ptr, method_len);
+  bpf_printk(
+      "ka_uprobe: ClientConn_Invoke goroutine=%lx method_ptr=%lx len=%lx",
+      goroutine_addr, method_ptr, method_len);
 
   struct go_grpc_client_invocation invocation = {
-    .start_ns = bpf_ktime_get_ns(),
-    .method_ptr = (u64)method_ptr,
-    .method_len = (u64)method_len,
+      .start_ns = bpf_ktime_get_ns(),
+      .method_ptr = (u64)method_ptr,
+      .method_len = (u64)method_len,
   };
 
-  bpf_map_update_elem(&ongoing_grpc_client_requests, &g_key, &invocation, BPF_ANY);
+  bpf_map_update_elem(&ongoing_grpc_client_requests, &g_key, &invocation,
+                      BPF_ANY);
   return 0;
 }
 
@@ -383,13 +394,13 @@ int ka_uretprobe_ClientConn_Invoke(struct pt_regs *ctx) {
   void *err = GO_PARAM1(ctx);
 
   struct go_grpc_client_invocation *invocation =
-    bpf_map_lookup_elem(&ongoing_grpc_client_requests, &g_key);
+      bpf_map_lookup_elem(&ongoing_grpc_client_requests, &g_key);
   if (!invocation) {
     goto done;
   }
 
-  struct go_grpc_request_event *event =
-    bpf_ringbuf_reserve(&go_http2_events, sizeof(struct go_grpc_request_event), 0);
+  struct go_grpc_request_event *event = bpf_ringbuf_reserve(
+      &go_http2_events, sizeof(struct go_grpc_request_event), 0);
   if (!event) {
     goto done;
   }
@@ -397,19 +408,19 @@ int ka_uretprobe_ClientConn_Invoke(struct pt_regs *ctx) {
   event->start_ns = invocation->start_ns;
   event->end_ns = bpf_ktime_get_ns();
   event->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
-  event->status = err ? 2 : 0;  /* Unknown=2 if error, OK=0 otherwise */
+  event->status = err ? 2 : 0; /* Unknown=2 if error, OK=0 otherwise */
   event->event_type = GO_GRPC_EVENT_CLIENT_REQUEST;
   event->path[0] = '\0';
 
   if (!read_go_str_n((void *)invocation->method_ptr, invocation->method_len,
-                      event->path, GRPC_MAX_PATH_SIZE)) {
+                     event->path, GRPC_MAX_PATH_SIZE)) {
     bpf_printk("ka_uretprobe: can't read client method");
     bpf_ringbuf_discard(event, 0);
     goto done;
   }
 
-  bpf_printk("ka_uretprobe: client path=%s latency=%llu ns",
-             event->path, event->end_ns - event->start_ns);
+  bpf_printk("ka_uretprobe: client path=%s latency=%llu ns", event->path,
+             event->end_ns - event->start_ns);
 
   bpf_ringbuf_submit(event, 0);
 
@@ -424,8 +435,9 @@ done:
  * method is at different register positions.
  *
  * Signature: func (cc *ClientConn) NewStream(ctx context.Context,
- *            desc *StreamDesc, method string, opts ...CallOption) (ClientStream, error)
- * Register ABI: cc=rax, ctx.type=rbx, ctx.data=rcx, desc=rdi, method.ptr=rsi, method.len=r8
+ *            desc *StreamDesc, method string, opts ...CallOption)
+ * (ClientStream, error) Register ABI: cc=rax, ctx.type=rbx, ctx.data=rcx,
+ * desc=rdi, method.ptr=rsi, method.len=r8
  */
 SEC("uprobe/ClientConn_NewStream")
 int ka_uprobe_ClientConn_NewStream(struct pt_regs *ctx) {
@@ -437,12 +449,13 @@ int ka_uprobe_ClientConn_NewStream(struct pt_regs *ctx) {
   void *method_len = GO_PARAM6(ctx);
 
   struct go_grpc_client_invocation invocation = {
-    .start_ns = bpf_ktime_get_ns(),
-    .method_ptr = (u64)method_ptr,
-    .method_len = (u64)method_len,
+      .start_ns = bpf_ktime_get_ns(),
+      .method_ptr = (u64)method_ptr,
+      .method_len = (u64)method_len,
   };
 
-  bpf_map_update_elem(&ongoing_grpc_client_requests, &g_key, &invocation, BPF_ANY);
+  bpf_map_update_elem(&ongoing_grpc_client_requests, &g_key, &invocation,
+                      BPF_ANY);
   return 0;
 }
 
@@ -459,12 +472,12 @@ int ka_uretprobe_clientStream_RecvMsg(struct pt_regs *ctx) {
   void *err = GO_PARAM1(ctx);
 
   struct go_grpc_client_invocation *invocation =
-    bpf_map_lookup_elem(&ongoing_grpc_client_requests, &g_key);
+      bpf_map_lookup_elem(&ongoing_grpc_client_requests, &g_key);
   if (!invocation)
     return 0;
 
-  struct go_grpc_request_event *event =
-    bpf_ringbuf_reserve(&go_http2_events, sizeof(struct go_grpc_request_event), 0);
+  struct go_grpc_request_event *event = bpf_ringbuf_reserve(
+      &go_http2_events, sizeof(struct go_grpc_request_event), 0);
   if (!event)
     goto done;
 
@@ -476,7 +489,7 @@ int ka_uretprobe_clientStream_RecvMsg(struct pt_regs *ctx) {
   event->path[0] = '\0';
 
   if (!read_go_str_n((void *)invocation->method_ptr, invocation->method_len,
-                      event->path, GRPC_MAX_PATH_SIZE)) {
+                     event->path, GRPC_MAX_PATH_SIZE)) {
     bpf_ringbuf_discard(event, 0);
     goto done;
   }

@@ -81,6 +81,15 @@ struct ssl_symaddrs {
   s32 bio_num_offset;  /* offsetof(BIO, num)  — holds the fd */
 };
 
+// grpcc_symaddrs — version-specific gRPC-C struct field offsets.
+// Written once by userspace at startup via grpcc_symaddrs_map[0].
+// MUST stay in sync with grpcc.GRPCCOffsets in Go.
+struct grpcc_symaddrs {
+    s32 stream_method_offset;   // offsetof(grpc_chttp2_stream,    method) — grpc_slice
+    s32 stream_id_offset;       // offsetof(grpc_chttp2_stream,    id)     — uint32
+    s32 transport_fd_offset;    // offsetof(grpc_chttp2_transport, fd)     — int
+};
+
 // Connection tracking key: {pid_tgid, fd} -> sock_ptr
 struct conn_id {
   u32 tgid;

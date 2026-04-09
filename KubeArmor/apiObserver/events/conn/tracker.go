@@ -18,6 +18,7 @@ import (
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/protocols/grpc"
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/protocols/http1"
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/protocols/http2"
+	"github.com/kubearmor/KubeArmor/KubeArmor/log"
 )
 
 // CorrelatorIface is the subset of events.Correlator that ConnectionTracker calls.
@@ -78,7 +79,7 @@ type TrackerConfig struct {
 func DefaultConfig() TrackerConfig {
 	return TrackerConfig{
 		InactivityTimeout: 5 * time.Minute,
-		MaxBufferSize:     128 * 1024, // 128KB per direction
+		MaxBufferSize:     192 * 1024, // 192KB per direction
 	}
 }
 
@@ -325,8 +326,8 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 					"consecutive", ct.parseErrCount)
 			}
 			if ct.parseErrCount >= maxConsecutiveParseErrors {
-				slog.Warn("HTTP/1: too many consecutive parse errors, resetting buffer",
-					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
+				log.Warnf("HTTP/1: too many consecutive parse errors, resetting buffer, sockptr: %s, protocol: %d",
+					fmt.Sprintf("0x%x", ct.Key.SockPtr), ct.Protocol)
 				ct.sendBuf.Reset()
 				ct.parseErrCount = 0
 			}
@@ -383,8 +384,8 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 					"consecutive", ct.parseErrCount)
 			}
 			if ct.parseErrCount >= maxConsecutiveParseErrors {
-				slog.Warn("HTTP/1: too many consecutive parse errors, resetting buffer",
-					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
+				log.Warnf("HTTP/1: too many consecutive parse errors, resetting buffer, sockptr: %s, protocol: %d",
+					fmt.Sprintf("0x%x", ct.Key.SockPtr), ct.Protocol)
 				ct.recvBuf.Reset()
 				ct.parseErrCount = 0
 			}

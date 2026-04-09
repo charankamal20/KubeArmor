@@ -9,8 +9,6 @@ import (
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/protocols/http2"
 )
  
-// WORK IN PROGRESS - gRPC/HTTP2 
-
 // serializeHTTP2Message converts HTTP/2 message to readable format
 func serializeHTTP2Message(msg *http2.Message) []byte {
 	var buf bytes.Buffer

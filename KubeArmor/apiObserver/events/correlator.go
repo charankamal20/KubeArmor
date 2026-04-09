@@ -63,6 +63,11 @@ type Correlator interface {
 	// the kprobe data pipeline.
 	InjectGoHTTP2Headers(key ConnectionKey, streamID uint32, headers map[string]string)
 
+	// InjectGRPCCEvent patches the :path for a pending HTTP/2 stream captured
+	// via gRPC-C uprobes (Python, C++, Ruby, PHP, C# services).
+	// Uses pid+fd+streamID as the lookup key; takes the mutex internally.
+	InjectGRPCCEvent(pid uint32, fd uint32, streamID uint32, method string)
+
 	// InjectGoGRPCEvent injects a complete gRPC request event from the
 	// Go uprobe pipeline. Unlike InjectGoHTTP2Headers which provides only
 	// headers, this provides the full path, status, and timing information.
@@ -432,6 +437,56 @@ func (c *defaultCorrelator) InjectGoHTTP2Headers(
 		}
 	}
 
+	streams.Requests[streamID] = req
+}
+
+// InjectGRPCCEvent is the fix for ":path: *" on non-Go gRPC services.
+//
+// The gRPC-C uprobe fires once per RPC at
+// grpc_chttp2_maybe_complete_recv_initial_metadata, reading
+// grpc_chttp2_stream.method directly from process memory. This bypasses
+// the HPACK dynamic table entirely and provides a ground-truth :path value
+// even when BPF attaches mid-stream.
+//
+// Merge strategy (same as InjectGoHTTP2Headers):
+//   - If a kprobe-created PendingRequest already exists for (key, streamID),
+//     patch its URL only if currently empty or the fallback "*".
+//   - If no request exists yet, create a placeholder so the response can still
+//     be matched when it arrives.
+func (c *defaultCorrelator) InjectGRPCCEvent(pid, fd, streamID uint32, method string) {
+	if method == "" || method == "*" {
+		return
+	}
+	key := ConnectionKey{PID: pid, FD: fd}
+
+	c.connToHTTP2StreamMu.Lock()
+	defer c.connToHTTP2StreamMu.Unlock()
+
+	streams, ok := c.connToHTTP2Stream[key]
+	if !ok {
+		streams = &HTTP2StreamRequests{Requests: make(map[uint32]PendingRequest)}
+		c.connToHTTP2Stream[key] = streams
+	}
+
+	req, exists := streams.Requests[streamID]
+	if !exists {
+		req = PendingRequest{
+			Timestamp: time.Now(),
+			StreamID:  streamID,
+			Headers:   make(map[string]string),
+		}
+	}
+
+	// Patch URL only when the kprobe data is absent or contains the fallback.
+	if req.URL == "" || req.URL == "*" || req.URL == "null" {
+		req.URL = method
+		slog.Debug("gRPC-C uprobe: patched :path",
+			"pid", pid, "fd", fd, "stream_id", streamID, "method", method)
+	}
+	// gRPC is always POST; set if kprobe hasn't populated it yet.
+	if req.Method == "" {
+		req.Method = "POST"
+	}
 	streams.Requests[streamID] = req
 }
 

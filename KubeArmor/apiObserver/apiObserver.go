@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	pb "github.com/accuknox/SentryFlow/protobuf/golang"
@@ -24,6 +25,7 @@ import (
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/events/conn"
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/filter"
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/goprobe"
+	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/grpcc"
 	"github.com/kubearmor/KubeArmor/KubeArmor/apiObserver/ssl"
 	fd "github.com/kubearmor/KubeArmor/KubeArmor/feeder"
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
@@ -48,6 +50,8 @@ type APIObserver struct {
 	// Go HTTP/2 header events ring buffer.
 	goHeaderEvents  *ringbuf.Reader
 	goHeaderChannel chan []byte
+	grpccEvents     *ringbuf.Reader // ring buffer for gRPC-C header events
+	grpccChannel    chan []byte
 
 	// Pipeline components.
 	filterer    *filter.Filterer
@@ -126,6 +130,17 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 
 	// Start background Go HTTP/2 uprobe scanner.
 	go ao.attachGoHTTP2Uprobes()
+
+	ao.grpccEvents, err = ringbuf.NewReader(ao.objs.GrpccEvents)
+	if err != nil {
+		ao.Logger.Warnf("gRPC-C events ring buffer not available: %v", err)
+	} else {
+		ao.grpccChannel = make(chan []byte, 1024)
+		ao.Logger.Print("gRPC-C events ring buffer created")
+	}
+
+	go ao.attachGRPCCUprobes()
+	go ao.drainGRPCCEvents()
 
 	return ao, nil
 }
@@ -579,11 +594,11 @@ func (ao *APIObserver) attachSSLUprobes() error {
 		if err != nil {
 			return fmt.Errorf("open %s: %w", libPath, err)
 		}
-		if l, err := ex.Uprobe("SSL_write", ao.objs.UprobeSslWrite, nil); err == nil {
+		if l, err := attachUprobeWithFallback(ex, "SSL_write", ao.objs.UprobeSslWrite, 0); err == nil {
 			ao.links = append(ao.links, l)
 			ao.Logger.Printf("uprobe/SSL_write attached (%s)", libPath)
 		}
-		if lEntry, err := ex.Uprobe("SSL_read", ao.objs.UprobeSslRead, nil); err == nil {
+		if lEntry, err := attachUprobeWithFallback(ex, "SSL_read", ao.objs.UprobeSslRead, 0); err == nil {
 			ao.links = append(ao.links, lEntry)
 			if lRet, err := ex.Uretprobe("SSL_read", ao.objs.UretprobeSslRead, nil); err == nil {
 				ao.links = append(ao.links, lRet)
@@ -646,9 +661,7 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 			for shortID, addr := range target.Symbols {
 				// Attach entry uprobe.
 				if prog, ok := probeMap[shortID]; ok {
-					l, err := ex.Uprobe("", prog, &link.UprobeOptions{
-						Address: addr,
-					})
+					l, err := attachUprobeWithFallback(ex, "", prog, addr)
 					if err != nil {
 						ao.Logger.Warnf("Failed to attach uprobe %s at 0x%x on %s: %v",
 							shortID, addr, target.BinaryPath, err)
@@ -662,9 +675,7 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 				// Attach return uprobe (uretprobe) if it exists.
 				retKey := shortID + "_ret"
 				if retProg, ok := probeMap[retKey]; ok {
-					l, err := ex.Uprobe("", retProg, &link.UprobeOptions{
-						Address: addr,
-					})
+					l, err := attachUprobeWithFallback(ex, "", retProg, addr)
 					if err != nil {
 						ao.Logger.Warnf("Failed to attach uretprobe %s at 0x%x on %s: %v",
 							retKey, addr, target.BinaryPath, err)
@@ -701,6 +712,130 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 			scanAndAttach()
 		}
 	}
+}
+
+// attachGRPCCUprobes scans for gRPC-C (libgrpc.so) binaries and attaches
+// the grpc_chttp2_maybe_complete_recv_initial_metadata uprobe.
+// Runs as a background goroutine; never returns an error.
+func (ao *APIObserver) attachGRPCCUprobes() {
+	ao.wg.Add(1)
+	defer ao.wg.Done()
+
+	attached := make(map[string]bool)
+
+	// Trigger first scan immediately without blocking the select.
+	doScan := make(chan struct{}, 1)
+	doScan <- struct{}{}
+
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ao.ctx.Done():
+			return
+		case <-doScan:
+			ao.scanAndAttachGRPCC(attached)
+		case <-ticker.C:
+			ao.scanAndAttachGRPCC(attached)
+		}
+	}
+}
+
+// drainGRPCCEvents reads the gRPC-C ring buffer and processes path events.
+func (ao *APIObserver) drainGRPCCEvents() {
+	ao.wg.Add(1)
+	defer ao.wg.Done()
+
+	if ao.grpccEvents == nil {
+		return
+	}
+
+	// Inner reader goroutine — NOT tracked in wg; exits via ErrClosed
+	// when DestroyAPIObserver calls ao.grpccEvents.Close().
+	go func() {
+		for {
+			record, err := ao.grpccEvents.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					return
+				}
+				continue
+			}
+			select {
+			case ao.grpccChannel <- record.RawSample:
+			case <-ao.ctx.Done():
+				return
+			}
+		}
+	}()
+
+	// Outer processing loop — tracked in wg; exits on ctx.Done().
+	for {
+		select {
+		case <-ao.ctx.Done():
+			return
+		case raw := <-ao.grpccChannel:
+			ao.processGRPCCEvent(raw)
+		}
+	}
+}
+
+// scanAndAttachGRPCC is the inner scan body, called from attachGRPCCUprobes.
+func (ao *APIObserver) scanAndAttachGRPCC(attached map[string]bool) {
+	targets, err := grpcc.ScanProc()
+	if err != nil {
+		ao.Logger.Warnf("gRPC-C proc scan error: %v", err)
+		return
+	}
+	for _, target := range targets {
+		if attached[target.LibPath] {
+			continue
+		}
+		offsets, err := grpcc.OffsetsForLib(target.LibPath)
+		if err != nil {
+			ao.Logger.Warnf("gRPC-C: %v", err)
+			continue
+		}
+		// Array map (max_entries=1) — key is always 0.
+		if err := ao.objs.GrpccSymaddrsMap.Put(uint32(0), offsets); err != nil {
+			ao.Logger.Warnf("gRPC-C: failed to write symaddrs for %s: %v", target.LibPath, err)
+			continue
+		}
+		ex, err := link.OpenExecutable(target.LibPath)
+		if err != nil {
+			ao.Logger.Warnf("gRPC-C: failed to open %s: %v", target.LibPath, err)
+			continue
+		}
+		l, err := ex.Uprobe(
+			"grpc_chttp2_maybe_complete_recv_initial_metadata",
+			ao.objs.KaUprobeGrpcC_recvInitialMetadataEntry,
+			nil,
+		)
+		if err != nil {
+			ao.Logger.Warnf("gRPC-C: uprobe attach failed on %s: %v", target.LibPath, err)
+			continue
+		}
+		ao.links = append(ao.links, l)
+		attached[target.LibPath] = true
+		ao.Logger.Printf("gRPC-C uprobe attached to %s (PID %d)", target.LibPath, target.PID)
+	}
+}
+
+// processGRPCCEvent decodes one ring-buffer sample and injects the
+// captured gRPC-C method path into the correlator.
+func (ao *APIObserver) processGRPCCEvent(raw []byte) {
+	ev, err := events.ParseGRPCCHeaderEvent(raw)
+	if err != nil {
+		ao.Logger.Debugf("ParseGRPCCHeaderEvent error: %v", err)
+		return
+	}
+	method := ev.MethodString()
+	if method == "" {
+		slog.Debug("gRPC-C uprobe: ignoring event with empty method", "pid", ev.PID)
+		return
+	}
+	ao.correlator.InjectGRPCCEvent(ev.PID, ev.FD, ev.StreamID, method)
 }
 
 // populateGoBPFMaps writes the offset table into the BPF map for a given target.
@@ -743,6 +878,12 @@ func (ao *APIObserver) DestroyAPIObserver() error {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
+	if ao.grpccEvents != nil {
+		if err := ao.grpccEvents.Close(); err != nil {
+			ao.Logger.Err(err.Error())
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
 	if err := ao.objs.Close(); err != nil {
 		ao.Logger.Err(err.Error())
 		cleanupErr = errors.Join(cleanupErr, err)
@@ -764,4 +905,44 @@ func (ao *APIObserver) DestroyAPIObserver() error {
 	}
 	ao.wg.Wait()
 	return cleanupErr
+}
+
+// eNOTSUPP is errno 524 — the Linux kernel's internal "not supported" error
+// returned by uprobe_register when the target address contains a trap instruction.
+// It is not exported by golang.org/x/sys/unix so we define it directly.
+const eNOTSUPP = syscall.Errno(524)
+
+func attachUprobeWithFallback(
+    ex *link.Executable,
+    sym string,
+    prog *ebpf.Program,
+    addr uint64,
+) (link.Link, error) {
+    var opts *link.UprobeOptions
+    if addr != 0 {
+        opts = &link.UprobeOptions{Address: addr}
+    }
+
+    l, err := ex.Uprobe(sym, prog, opts)
+    if err == nil {
+        return l, nil
+    }
+
+    // Retry at addr+1 only when:
+    //   (a) we have an explicit address to offset from (addr != 0), AND
+    //   (b) the kernel rejected the address as a trap/NOP sled (errno 524).
+    // When addr==0, cilium/ebpf resolves by symbol name; we have no known
+    // base address to offset from, so retrying makes no sense.
+    isNotSupp := errors.Is(err, eNOTSUPP) ||
+        strings.Contains(err.Error(), "errno 524")
+
+    if addr != 0 && isNotSupp {
+        l2, err2 := ex.Uprobe(sym, prog, &link.UprobeOptions{Address: addr + 1})
+        if err2 == nil {
+            return l2, nil
+        }
+        // Return the original error — it's more informative than addr+1 failure.
+    }
+
+    return nil, err
 }
