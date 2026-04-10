@@ -16,15 +16,28 @@ package events
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/kubearmor/KubeArmor/KubeArmor/log"
 )
 
 // maxPendingRequestsPerConn is the maximum number of in-flight HTTP/1.x pipelined
 // requests allowed per connection before old ones are dropped.
 const maxPendingRequestsPerConn = 256
+
+type transportHeaderKey struct {
+	PID      uint32
+	StreamID uint32
+}
+
+type transportHeaderEntry struct {
+	Headers   map[string]string
+	CreatedAt time.Time
+}
 
 // Correlator matches HTTP requests to their responses and emits
 // CorrelatedTrace records.  It is safe for concurrent use.
@@ -62,6 +75,13 @@ type Correlator interface {
 	// a placeholder. This is the bridge between Go uprobe header data and
 	// the kprobe data pipeline.
 	InjectGoHTTP2Headers(key ConnectionKey, streamID uint32, headers map[string]string)
+
+	// InjectGoHTTP2TransportHeaders stores post-HPACK decoded headers from the
+	// operateHeaders uprobe for later merging when the kprobe path registers the
+	// same stream.  pid+streamID is the correlation key.
+	InjectGoHTTP2TransportHeaders(
+		pid, streamID uint32, hdrs map[string]string,
+	)
 
 	// InjectGRPCCEvent patches the :path for a pending HTTP/2 stream captured
 	// via gRPC-C uprobes (Python, C++, Ruby, PHP, C# services).
@@ -126,6 +146,8 @@ type defaultCorrelator struct {
 	// HTTP/2 / gRPC: per-connection, per-stream-ID pending request map.
 	connToHTTP2Stream   map[ConnectionKey]*HTTP2StreamRequests
 	connToHTTP2StreamMu sync.Mutex
+	transportHeaders    map[transportHeaderKey]transportHeaderEntry
+	transportHeadersMu  sync.Mutex
 
 	timeout time.Duration
 	stats   correlatorStats
@@ -261,6 +283,43 @@ func (c *defaultCorrelator) AddHTTP2Request(
 	streamID uint32,
 	req PendingRequest,
 ) {
+	// Check if operateHeaders uprobe already decoded headers for this
+	// (pid, streamID). The uprobe fires first (Go runtime HPACK decode),
+	// the kprobe path fires later (syscall return). Merge here so the stored
+	// request always has a resolved path even for mid-stream connections.
+	tKey := transportHeaderKey{PID: key.PID, StreamID: streamID}
+	c.transportHeadersMu.Lock()
+	if entry, ok := c.transportHeaders[tKey]; ok {
+		hdrs := entry.Headers
+		log.Debug(fmt.Sprint("Transport headers hit in AddHTTP2Request",
+			"pid", key.PID,
+			"stream_id", streamID,
+			"path", hdrs[":path"],
+			"method", hdrs[":method"],
+		))
+		// Pseudo-headers win over HPACK-reconstructed values.
+		if path, ok := hdrs[":path"]; ok && path != "" {
+			req.URL = path
+		}
+		if method, ok := hdrs[":method"]; ok && method != "" {
+			req.Method = method
+		}
+		if ct, ok := hdrs["content-type"]; ok && ct != "" {
+			req.ContentType = ct
+		}
+		// Copy any remaining headers without overwriting existing ones.
+		if req.Headers == nil {
+			req.Headers = make(map[string]string)
+		}
+		for k, v := range hdrs {
+			if _, exists := req.Headers[k]; !exists {
+				req.Headers[k] = v
+			}
+		}
+		delete(c.transportHeaders, tKey)
+	}
+	c.transportHeadersMu.Unlock()
+
 	c.connToHTTP2StreamMu.Lock()
 
 	streams, ok := c.connToHTTP2Stream[key]
@@ -279,14 +338,14 @@ func (c *defaultCorrelator) AddHTTP2Request(
 	c.stats.totalRequests.Add(1)
 	c.stats.http2Streams.Add(1)
 
-	slog.Debug("HTTP/2 request stored",
+	log.Debug(fmt.Sprint("HTTP/2 request stored",
 		"PID", key.PID,
 		"FD", key.FD,
 		"sockptr", key.SockPtr,
 		"stream_id", streamID,
 		"method", req.Method,
 		"url", req.URL,
-	)
+	))
 }
 
 // MatchHTTP2Response looks up the pending request for (key, streamID),
@@ -347,7 +406,7 @@ func (c *defaultCorrelator) MatchHTTP2Response(
 	c.stats.totalResponses.Add(1)
 	c.stats.matchedPairs.Add(1)
 
-	slog.Debug("HTTP/2 request-response matched",
+	log.Debug(fmt.Sprint("HTTP/2 request-response matched",
 		"PID", key.PID,
 		"FD", key.FD,
 		"sockptr", key.SockPtr,
@@ -355,7 +414,7 @@ func (c *defaultCorrelator) MatchHTTP2Response(
 		"method", req.Method,
 		"status", status,
 		"duration_ns", durationNs,
-	)
+	))
 	return trace
 }
 
@@ -651,4 +710,16 @@ func (c *defaultCorrelator) GetStats() CorrelatorStats {
 	c.connToHTTP2StreamMu.Unlock()
 
 	return snap
+}
+
+func (c *defaultCorrelator) InjectGoHTTP2TransportHeaders(
+	pid, streamID uint32, hdrs map[string]string,
+) {
+	key := transportHeaderKey{PID: pid, StreamID: streamID}
+	c.transportHeadersMu.Lock()
+	c.transportHeaders[key] = transportHeaderEntry{
+		Headers:   hdrs,
+		CreatedAt: time.Now(),
+	}
+	c.transportHeadersMu.Unlock()
 }

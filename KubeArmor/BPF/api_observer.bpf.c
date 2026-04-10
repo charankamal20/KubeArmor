@@ -136,3 +136,12 @@ SEC("kprobe/sys_close")
 int kprobe_sys_close(struct pt_regs *ctx) {
     return handle_close_entry(ctx);
 }
+
+SEC("uprobe/operate_headers_server")
+int ka_uprobe_operate_headers_server_entry(struct pt_regs *ctx) {
+    return ka_uprobe_operate_headers_server(ctx);
+}
+SEC("uprobe/operate_headers_client")
+int ka_uprobe_operate_headers_client_entry(struct pt_regs *ctx) {
+    return ka_uprobe_operate_headers_client(ctx);
+}

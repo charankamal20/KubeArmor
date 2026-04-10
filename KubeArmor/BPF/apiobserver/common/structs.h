@@ -116,3 +116,25 @@ struct stats {
   u64 dropped_packets;
   u64 parse_errors;
 };
+
+// Emitted by ka_uprobe_operate_headers_{server,client}.
+// Carries post-HPACK decoded header fields read directly from
+// golang.org/x/net/http2.MetaHeadersFrame.Fields ([]hpack.HeaderField).
+// Sized for BPF ring-buf: 8 bytes header + 8*(32+128) = 1288 bytes total.
+#define GO_H2_MAX_FIELDS  8
+#define GO_H2_NAME_SIZE   32
+#define GO_H2_VAL_SIZE    128
+
+struct go_h2_hdr_field {
+    char name[GO_H2_NAME_SIZE];
+    char value[GO_H2_VAL_SIZE];
+};
+
+struct go_h2_transport_event {
+    __u32 pid;
+    __u32 stream_id;
+    __u8  is_server;  // 1 = server operateHeaders, 0 = client
+    __u8  field_count;
+    __u16 pad;
+    struct go_h2_hdr_field fields[GO_H2_MAX_FIELDS];
+};

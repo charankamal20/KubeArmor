@@ -45,7 +45,7 @@ enum go_grpc_event_type {
 
 /* ---- Goroutine + PID key for BPF map lookups ---- */
 struct go_addr_key {
-  u64 addr;  /* goroutine address */
+  u64 addr; /* goroutine address */
   u32 pid;
   u32 _pad;
 };
@@ -116,7 +116,8 @@ struct {
 
 /* ---- Helpers ---- */
 
-static __always_inline void go_addr_key_init(struct go_addr_key *key, void *goroutine) {
+static __always_inline void go_addr_key_init(struct go_addr_key *key,
+                                             void *goroutine) {
   key->addr = (u64)goroutine;
   key->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
   key->_pad = 0;
@@ -220,14 +221,16 @@ int ka_uprobe_server_handleStream(struct pt_regs *ctx) {
     }
   }
 
-  bpf_printk("ka_uprobe: server_handleStream goroutine=%lx stream=%lx", goroutine_addr, stream_ptr);
+  bpf_printk("ka_uprobe: server_handleStream goroutine=%lx stream=%lx",
+             goroutine_addr, stream_ptr);
 
   struct go_grpc_server_invocation invocation = {
-    .start_ns = bpf_ktime_get_ns(),
-    .stream_ptr = (u64)stream_ptr,
+      .start_ns = bpf_ktime_get_ns(),
+      .stream_ptr = (u64)stream_ptr,
   };
 
-  bpf_map_update_elem(&ongoing_grpc_server_requests, &g_key, &invocation, BPF_ANY);
+  bpf_map_update_elem(&ongoing_grpc_server_requests, &g_key, &invocation,
+                      BPF_ANY);
   return 0;
 }
 
@@ -499,4 +502,124 @@ int ka_uretprobe_clientStream_RecvMsg(struct pt_regs *ctx) {
 done:
   bpf_map_delete_elem(&ongoing_grpc_client_requests, &g_key);
   return 0;
+}
+
+// operateHeaders helpers
+
+// MetaHeadersFrame fixed offsets (golang.org/x/net/http2, stable since Go 1.9)
+//   offset  0: *HeadersFrame  (8 bytes)
+//   offset  8: Fields.Ptr     (8 bytes) ← slice data pointer to
+//   []hpack.HeaderField offset 16: Fields.Len     (8 bytes) offset 24:
+//   Fields.Cap     (8 bytes)
+// FrameHeader (embedded at start of HeadersFrame):
+//   offset  0: valid  (1)  Type (1)  Flags (1)  pad (1)
+//   offset  4: Length (u32)
+//   offset  8: StreamID (u32)
+// hpack.HeaderField = 32 bytes:
+//   offset  0: Name.Ptr  (8)  Name.Len  (8)
+//   offset 16: Value.Ptr (8)  Value.Len (8)
+
+#define META_FIELDS_PTR_OFF 8
+#define META_FIELDS_LEN_OFF 16
+#define HFRAME_STREAM_ID_OFF 8
+#define HFIELD_SIZE 32
+#define HFIELD_NAME_PTR_OFF 0
+#define HFIELD_NAME_LEN_OFF 8
+#define HFIELD_VAL_PTR_OFF 16
+#define HFIELD_VAL_LEN_OFF 24
+
+static __always_inline int __emit_operate_headers(struct pt_regs *ctx,
+                                                  __u8 is_server) {
+  void *frame_ptr = GO_PARAM2(ctx);
+  if (!frame_ptr)
+    return 0;
+
+  __u64 hframe_ptr = 0;
+  if (bpf_probe_read_user(&hframe_ptr, sizeof(hframe_ptr), frame_ptr) != 0 ||
+      !hframe_ptr)
+    return 0;
+
+  __u32 stream_id = 0;
+  if (bpf_probe_read_user(&stream_id, sizeof(stream_id),
+                          (void *)(hframe_ptr + HFRAME_STREAM_ID_OFF)) != 0)
+    return 0;
+
+  __u64 fields_ptr = 0, fields_len = 0;
+  bpf_probe_read_user(&fields_ptr, sizeof(fields_ptr),
+                      (void *)((__u64)frame_ptr + META_FIELDS_PTR_OFF));
+  bpf_probe_read_user(&fields_len, sizeof(fields_len),
+                      (void *)((__u64)frame_ptr + META_FIELDS_LEN_OFF));
+  if (!fields_ptr || !fields_len)
+    return 0;
+
+  // Use per-CPU scratch — ringbuf-reserved pointers reject zero-assignment.
+  __u32 zero = 0;
+  struct go_h2_transport_event *ev =
+      bpf_map_lookup_elem(&go_h2_transport_scratch, &zero);
+  if (!ev)
+    return 0;
+
+  // Per-CPU map values support normal assignment; safe to zero here.
+  ev->pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+  ev->stream_id = stream_id;
+  ev->is_server = is_server;
+  ev->pad = 0;
+  ev->field_count = 0;
+
+  __u64 n = fields_len < GO_H2_MAX_FIELDS ? fields_len : GO_H2_MAX_FIELDS;
+
+#pragma unroll
+  for (int i = 0; i < GO_H2_MAX_FIELDS; i++) {
+    // Mark slot empty at the top of every iteration — clears stale data
+    // from the previous call on this CPU and handles the continue paths.
+    ev->fields[i].name[0] = '\0';
+    ev->fields[i].value[0] = '\0';
+
+    if ((__u64)i >= n)
+      continue;
+
+    __u64 foff = fields_ptr + (__u64)i * HFIELD_SIZE;
+
+    __u64 nptr = 0, nlen = 0, vptr = 0, vlen = 0;
+    bpf_probe_read_user(&nptr, sizeof(nptr),
+                        (void *)(foff + HFIELD_NAME_PTR_OFF));
+    bpf_probe_read_user(&nlen, sizeof(nlen),
+                        (void *)(foff + HFIELD_NAME_LEN_OFF));
+    bpf_probe_read_user(&vptr, sizeof(vptr),
+                        (void *)(foff + HFIELD_VAL_PTR_OFF));
+    bpf_probe_read_user(&vlen, sizeof(vlen),
+                        (void *)(foff + HFIELD_VAL_LEN_OFF));
+
+    if (!nptr || !nlen || nlen >= GO_H2_NAME_SIZE)
+      continue; // slot already marked empty above
+
+    bpf_probe_read_user_str(ev->fields[i].name, GO_H2_NAME_SIZE, (void *)nptr);
+    if (vptr && vlen > 0 && vlen < GO_H2_VAL_SIZE)
+      bpf_probe_read_user_str(ev->fields[i].value, GO_H2_VAL_SIZE,
+                              (void *)vptr);
+
+    ev->field_count++;
+  }
+
+  if (ev->field_count == 0)
+    return 0;
+
+  // bpf_ringbuf_output copies from map pointer into the ringbuf —
+  // no MEM_RINGBUF pointer is ever touched directly.
+  bpf_ringbuf_output(&go_h2_transport_events, ev, sizeof(*ev), 0);
+  return 0;
+}
+
+// uprobe:
+// google.golang.org/grpc/internal/transport.(*http2Server).operateHeaders
+SEC("uprobe/operate_headers_server")
+int ka_uprobe_operate_headers_server(struct pt_regs *ctx) {
+  return __emit_operate_headers(ctx, 1);
+}
+
+// uprobe:
+// google.golang.org/grpc/internal/transport.(*http2Client).operateHeaders
+SEC("uprobe/operate_headers_client")
+int ka_uprobe_operate_headers_client(struct pt_regs *ctx) {
+  return __emit_operate_headers(ctx, 0);
 }

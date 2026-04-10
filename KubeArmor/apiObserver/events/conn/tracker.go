@@ -8,7 +8,6 @@ package conn
 
 import (
 	"bytes"
-	"encoding/binary"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -293,7 +292,7 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		// capture skipBytes (was discarded with _)
 		reqs, consumed, skipBytes, _, err := ct.http1Req.Parse(data)
-		
+
 		if consumed > 0 {
 			ct.parseErrCount = 0
 			ct.sendBuf.Advance(consumed)
@@ -348,7 +347,7 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		// capture skipBytes (was discarded with _)
 		resps, consumed, skipBytes, _, err := ct.http1Resp.Parse(data)
-		
+
 		if consumed > 0 {
 			ct.parseErrCount = 0
 			ct.recvBuf.Advance(consumed)
@@ -413,29 +412,6 @@ func isHTTP1RequestPrefix(buf []byte) bool {
 	return false
 }
 
-// isLikelyGRPCBody returns true if body starts with a valid gRPC Length-Prefixed
-// Message (LPM) header: [1-byte compressed flag (0|1)][4-byte BE length].
-// This heuristic is used when content-type is missing from HPACK due to
-// dynamic table invisibility on mid-stream connections.
-func isLikelyGRPCBody(body []byte) bool {
-	if len(body) < 5 {
-		return false
-	}
-	// Compressed flag must be 0 or 1.
-	if body[0] > 1 {
-		return false
-	}
-	// Payload length from 4-byte big-endian.
-	payloadLen := binary.BigEndian.Uint32(body[1:5])
-	// Length must be plausible: non-zero and not exceed remaining body.
-	if payloadLen == 0 || payloadLen > 16*1024*1024 {
-		return false
-	}
-	// The full message should be at most payloadLen + 5 bytes.
-	// Allow truncated bodies where we have less than the full payload.
-	return true
-}
-
 // iterHTTP2 extracts HTTP/2 frames, identifies request/response by stream ID,
 // and feeds them to the correlator.
 func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface) []*events.CorrelatedTrace {
@@ -484,23 +460,18 @@ func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface
 		}
 		isGRPCContent := grpc.IsGRPCContentType(contentType)
 
-		// Heuristic gRPC detection when content-type is missing
-		// (HPACK dynamic table miss). Modeled after OpenTelemetry.
 		if !isGRPCContent {
 			if ct.detectedGRPC {
-				// Connection already identified as gRPC.
 				isGRPCContent = true
 				contentType = "application/grpc"
-			} else if msg.Method == "POST" && isLikelyGRPCBody(msg.Body) {
-				// LPM body heuristic: body starts with valid gRPC frame.
+			} else if grpc.IsGRPCBody(msg.Body) {
 				isGRPCContent = true
 				contentType = "application/grpc"
 				ct.detectedGRPC = true
-				slog.Debug("gRPC detected by body heuristic",
-					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
+				log.Debug(fmt.Sprint("gRPC detected by body heuristic",
+					"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr)))
 			}
 		} else {
-			// Explicit content-type seen — remember for future streams.
 			ct.detectedGRPC = true
 		}
 
@@ -650,7 +621,7 @@ func (ct *ConnectionTracker) iterGRPC(ev *events.DataEvent, cor CorrelatorIface)
 			if ct.detectedGRPC {
 				isGRPC = true
 				contentType = "application/grpc"
-			} else if msg.Method == "POST" && isLikelyGRPCBody(msg.Body) {
+			} else if grpc.IsGRPCBody(msg.Body) {
 				isGRPC = true
 				contentType = "application/grpc"
 				ct.detectedGRPC = true

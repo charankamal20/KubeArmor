@@ -120,6 +120,20 @@ type apiObserverGoGrpcServerInvocation struct {
 	StreamPtr uint64
 }
 
+type apiObserverGoH2TransportEvent struct {
+	_          structs.HostLayout
+	Pid        uint32
+	StreamId   uint32
+	IsServer   uint8
+	FieldCount uint8
+	Pad        uint16
+	Fields     [8]struct {
+		_     structs.HostLayout
+		Name  [32]int8
+		Value [128]int8
+	}
+}
+
 type apiObserverGoOffsetTable struct {
 	_       structs.HostLayout
 	Offsets [17]int64
@@ -200,6 +214,10 @@ type apiObserverProgramSpecs struct {
 	KaUprobeClientConnInvoke               *ebpf.ProgramSpec `ebpf:"ka_uprobe_ClientConn_Invoke"`
 	KaUprobeClientConnNewStream            *ebpf.ProgramSpec `ebpf:"ka_uprobe_ClientConn_NewStream"`
 	KaUprobeGrpcC_recvInitialMetadataEntry *ebpf.ProgramSpec `ebpf:"ka_uprobe_grpc_c_recv_initial_metadata_entry"`
+	KaUprobeOperateHeadersClient           *ebpf.ProgramSpec `ebpf:"ka_uprobe_operate_headers_client"`
+	KaUprobeOperateHeadersClientEntry      *ebpf.ProgramSpec `ebpf:"ka_uprobe_operate_headers_client_entry"`
+	KaUprobeOperateHeadersServer           *ebpf.ProgramSpec `ebpf:"ka_uprobe_operate_headers_server"`
+	KaUprobeOperateHeadersServerEntry      *ebpf.ProgramSpec `ebpf:"ka_uprobe_operate_headers_server_entry"`
 	KaUprobeServerHandleStream             *ebpf.ProgramSpec `ebpf:"ka_uprobe_server_handleStream"`
 	KaUprobeTransportWriteStatus           *ebpf.ProgramSpec `ebpf:"ka_uprobe_transport_writeStatus"`
 	KaUretprobeClientConnInvoke            *ebpf.ProgramSpec `ebpf:"ka_uretprobe_ClientConn_Invoke"`
@@ -245,6 +263,8 @@ type apiObserverMapSpecs struct {
 	ConnectionFilterCache     *ebpf.MapSpec `ebpf:"connection_filter_cache"`
 	Connections               *ebpf.MapSpec `ebpf:"connections"`
 	EventScratch              *ebpf.MapSpec `ebpf:"event_scratch"`
+	GoH2TransportEvents       *ebpf.MapSpec `ebpf:"go_h2_transport_events"`
+	GoH2TransportScratch      *ebpf.MapSpec `ebpf:"go_h2_transport_scratch"`
 	GoHttp2Events             *ebpf.MapSpec `ebpf:"go_http2_events"`
 	GoOffsetsMap              *ebpf.MapSpec `ebpf:"go_offsets_map"`
 	GrpccEvents               *ebpf.MapSpec `ebpf:"grpcc_events"`
@@ -304,6 +324,8 @@ type apiObserverMaps struct {
 	ConnectionFilterCache     *ebpf.Map `ebpf:"connection_filter_cache"`
 	Connections               *ebpf.Map `ebpf:"connections"`
 	EventScratch              *ebpf.Map `ebpf:"event_scratch"`
+	GoH2TransportEvents       *ebpf.Map `ebpf:"go_h2_transport_events"`
+	GoH2TransportScratch      *ebpf.Map `ebpf:"go_h2_transport_scratch"`
 	GoHttp2Events             *ebpf.Map `ebpf:"go_http2_events"`
 	GoOffsetsMap              *ebpf.Map `ebpf:"go_offsets_map"`
 	GrpccEvents               *ebpf.Map `ebpf:"grpcc_events"`
@@ -339,6 +361,8 @@ func (m *apiObserverMaps) Close() error {
 		m.ConnectionFilterCache,
 		m.Connections,
 		m.EventScratch,
+		m.GoH2TransportEvents,
+		m.GoH2TransportScratch,
 		m.GoHttp2Events,
 		m.GoOffsetsMap,
 		m.GrpccEvents,
@@ -373,6 +397,10 @@ type apiObserverPrograms struct {
 	KaUprobeClientConnInvoke               *ebpf.Program `ebpf:"ka_uprobe_ClientConn_Invoke"`
 	KaUprobeClientConnNewStream            *ebpf.Program `ebpf:"ka_uprobe_ClientConn_NewStream"`
 	KaUprobeGrpcC_recvInitialMetadataEntry *ebpf.Program `ebpf:"ka_uprobe_grpc_c_recv_initial_metadata_entry"`
+	KaUprobeOperateHeadersClient           *ebpf.Program `ebpf:"ka_uprobe_operate_headers_client"`
+	KaUprobeOperateHeadersClientEntry      *ebpf.Program `ebpf:"ka_uprobe_operate_headers_client_entry"`
+	KaUprobeOperateHeadersServer           *ebpf.Program `ebpf:"ka_uprobe_operate_headers_server"`
+	KaUprobeOperateHeadersServerEntry      *ebpf.Program `ebpf:"ka_uprobe_operate_headers_server_entry"`
 	KaUprobeServerHandleStream             *ebpf.Program `ebpf:"ka_uprobe_server_handleStream"`
 	KaUprobeTransportWriteStatus           *ebpf.Program `ebpf:"ka_uprobe_transport_writeStatus"`
 	KaUretprobeClientConnInvoke            *ebpf.Program `ebpf:"ka_uretprobe_ClientConn_Invoke"`
@@ -406,6 +434,10 @@ func (p *apiObserverPrograms) Close() error {
 		p.KaUprobeClientConnInvoke,
 		p.KaUprobeClientConnNewStream,
 		p.KaUprobeGrpcC_recvInitialMetadataEntry,
+		p.KaUprobeOperateHeadersClient,
+		p.KaUprobeOperateHeadersClientEntry,
+		p.KaUprobeOperateHeadersServer,
+		p.KaUprobeOperateHeadersServerEntry,
 		p.KaUprobeServerHandleStream,
 		p.KaUprobeTransportWriteStatus,
 		p.KaUretprobeClientConnInvoke,

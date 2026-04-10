@@ -102,3 +102,20 @@ struct {
   __type(key, u32);
   __type(value, struct ssl_symaddrs);
 } ssl_symaddrs SEC(".maps");
+
+// Ring buffer for operateHeaders transport-level header events.
+// Written via bpf_ringbuf_output from go_h2_transport_scratch (per-CPU).
+struct {
+    __uint(type, BPF_MAP_TYPE_RINGBUF);
+    __uint(max_entries, 2 * 1024 * 1024);
+} go_h2_transport_events SEC(".maps");
+
+// Per-CPU scratch for go_h2_transport_event.
+// Used because bpf_ringbuf_reserve pointers reject zero-assignment
+// (BPF clang lowers = 0 to __builtin_memset which is banned on MEM_RINGBUF).
+struct {
+    __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+    __uint(max_entries, 1);
+    __type(key, __u32);
+    __type(value, struct go_h2_transport_event);
+} go_h2_transport_scratch SEC(".maps");

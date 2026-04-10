@@ -54,8 +54,8 @@ const (
 	GoOffGRPCServerStreamStream = 13
 	GoOffGRPCServerStreamST     = 14
 	GoOffGRPCStreamST           = 15
-	GoOffTLSConnConn            = 16 
-	GoOffMax                    = 17 
+	GoOffTLSConnConn            = 16
+	GoOffMax                    = 17
 )
 
 // GoOffsetTable matches BPF struct go_offset_table.
@@ -109,6 +109,12 @@ var TargetSymbols = map[string][]string{
 	},
 	"clientStream_RecvMsg": {
 		"google.golang.org/grpc.(*clientStream).RecvMsg",
+	},
+	"operate_headers_server": {
+		"google.golang.org/grpc/internal/transport.(*http2Server).operateHeaders",
+	},
+	"operate_headers_client": {
+		"google.golang.org/grpc/internal/transport.(*http2Client).operateHeaders",
 	},
 }
 

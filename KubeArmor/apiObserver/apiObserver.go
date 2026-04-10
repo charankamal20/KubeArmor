@@ -53,6 +53,9 @@ type APIObserver struct {
 	grpccEvents     *ringbuf.Reader // ring buffer for gRPC-C header events
 	grpccChannel    chan []byte
 
+	goH2TransportEvents  *ringbuf.Reader
+	goH2TransportChannel chan []byte
+
 	// Pipeline components.
 	filterer    *filter.Filterer
 	correlator  events.Correlator
@@ -123,6 +126,13 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 	} else {
 		ao.goHeaderChannel = make(chan []byte, 2048)
 		ao.Logger.Print("Go HTTP/2 header events ring buffer created")
+	}
+	ao.goH2TransportEvents, err = ringbuf.NewReader(ao.objs.GoH2TransportEvents)
+	if err != nil {
+		ao.Logger.Warnf("Go HTTP/2 transport events ring buffer not available (operateHeaders disabled): %v", err)
+	} else {
+		ao.goH2TransportChannel = make(chan []byte, 2048)
+		ao.Logger.Print("Go HTTP/2 transport events ring buffer created")
 	}
 
 	go ao.TraceEvents()
@@ -625,6 +635,8 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 		"ClientConn_Invoke_ret":    ao.objs.KaUretprobeClientConnInvoke,
 		"ClientConn_NewStream":     ao.objs.KaUprobeClientConnNewStream,
 		"clientStream_RecvMsg_ret": ao.objs.KaUretprobeClientStreamRecvMsg,
+		"operate_headers_server":   ao.objs.KaUprobeOperateHeadersServer,
+		"operate_headers_client":   ao.objs.KaUprobeOperateHeadersClient,
 	}
 
 	// Track attached binaries to avoid re-probing.
@@ -698,8 +710,8 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 	// Initial scan.
 	scanAndAttach()
 
-	// Start the Go header events reader after initial scan.
 	go ao.drainGoHeaderEvents()
+	go ao.drainGoH2TransportEvents()
 
 	// Periodic rescan for new Go binaries (every 30 seconds).
 	ticker := time.NewTicker(30 * time.Second)
@@ -777,6 +789,57 @@ func (ao *APIObserver) drainGRPCCEvents() {
 			return
 		case raw := <-ao.grpccChannel:
 			ao.processGRPCCEvent(raw)
+		}
+	}
+}
+
+// drainGoH2TransportEvents reads transport-level header events from the
+// operateHeaders uprobes and injects them into the correlator staging map.
+// These events carry post-HPACK decoded headers and arrive BEFORE the
+// matching kprobe syscall event, allowing AddHTTP2Request to merge them.
+func (ao *APIObserver) drainGoH2TransportEvents() {
+	ao.wg.Add(1)
+	defer ao.wg.Done()
+
+	if ao.goH2TransportEvents == nil {
+		return
+	}
+
+	ao.Logger.Print("Starting Go HTTP/2 transport events reader")
+
+	go func() {
+		for {
+			record, err := ao.goH2TransportEvents.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					return
+				}
+				ao.Logger.Warnf("Go H2 transport ringbuf read error: %v", err)
+				continue
+			}
+			select {
+			case ao.goH2TransportChannel <- record.RawSample:
+			case <-ao.ctx.Done():
+				return
+			default:
+				slog.Debug("Dropping Go H2 transport event due to load")
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ao.ctx.Done():
+			return
+		case raw := <-ao.goH2TransportChannel:
+			ev, err := events.ParseGoH2TransportEvent(raw)
+			if err != nil {
+				ao.Logger.Debugf("ParseGoH2TransportEvent error: %v", err)
+				continue
+			}
+			ao.Logger.Printf("Go H2 transport event: pid=%d stream=%d is_server=%d method=%q path=%q",
+				ev.PID, ev.StreamID, ev.IsServer, ev.Headers()[":method"], ev.Headers()[":path"])
+			ao.correlator.InjectGoHTTP2TransportHeaders(ev.PID, ev.StreamID, ev.Headers())
 		}
 	}
 }
@@ -878,6 +941,12 @@ func (ao *APIObserver) DestroyAPIObserver() error {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
+	if ao.goH2TransportEvents != nil {
+		if err := ao.goH2TransportEvents.Close(); err != nil {
+			ao.Logger.Err(err.Error())
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
 	if ao.grpccEvents != nil {
 		if err := ao.grpccEvents.Close(); err != nil {
 			ao.Logger.Err(err.Error())
@@ -913,36 +982,36 @@ func (ao *APIObserver) DestroyAPIObserver() error {
 const eNOTSUPP = syscall.Errno(524)
 
 func attachUprobeWithFallback(
-    ex *link.Executable,
-    sym string,
-    prog *ebpf.Program,
-    addr uint64,
+	ex *link.Executable,
+	sym string,
+	prog *ebpf.Program,
+	addr uint64,
 ) (link.Link, error) {
-    var opts *link.UprobeOptions
-    if addr != 0 {
-        opts = &link.UprobeOptions{Address: addr}
-    }
+	var opts *link.UprobeOptions
+	if addr != 0 {
+		opts = &link.UprobeOptions{Address: addr}
+	}
 
-    l, err := ex.Uprobe(sym, prog, opts)
-    if err == nil {
-        return l, nil
-    }
+	l, err := ex.Uprobe(sym, prog, opts)
+	if err == nil {
+		return l, nil
+	}
 
-    // Retry at addr+1 only when:
-    //   (a) we have an explicit address to offset from (addr != 0), AND
-    //   (b) the kernel rejected the address as a trap/NOP sled (errno 524).
-    // When addr==0, cilium/ebpf resolves by symbol name; we have no known
-    // base address to offset from, so retrying makes no sense.
-    isNotSupp := errors.Is(err, eNOTSUPP) ||
-        strings.Contains(err.Error(), "errno 524")
+	// Retry at addr+1 only when:
+	//   (a) we have an explicit address to offset from (addr != 0), AND
+	//   (b) the kernel rejected the address as a trap/NOP sled (errno 524).
+	// When addr==0, cilium/ebpf resolves by symbol name; we have no known
+	// base address to offset from, so retrying makes no sense.
+	isNotSupp := errors.Is(err, eNOTSUPP) ||
+		strings.Contains(err.Error(), "errno 524")
 
-    if addr != 0 && isNotSupp {
-        l2, err2 := ex.Uprobe(sym, prog, &link.UprobeOptions{Address: addr + 1})
-        if err2 == nil {
-            return l2, nil
-        }
-        // Return the original error — it's more informative than addr+1 failure.
-    }
+	if addr != 0 && isNotSupp {
+		l2, err2 := ex.Uprobe(sym, prog, &link.UprobeOptions{Address: addr + 1})
+		if err2 == nil {
+			return l2, nil
+		}
+		// Return the original error — it's more informative than addr+1 failure.
+	}
 
-    return nil, err
+	return nil, err
 }
