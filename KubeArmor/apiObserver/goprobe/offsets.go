@@ -55,7 +55,23 @@ func DefaultOffsetTable() GoOffsetTable {
 	ot.Offsets[GoOffGRPCServerStreamStream] = -1
 	ot.Offsets[GoOffGRPCServerStreamST] = -1
 	ot.Offsets[GoOffGRPCStreamST] = -1
-	ot.Offsets[GoOffTLSConnConn] = -1
+	// Go crypto/tls: tls.Conn.conn offset (Go interface {type, ptr} at offset 0).
+	// The conn field is the first field in crypto/tls.Conn across all Go versions.
+	// FD chain: tls.Conn.conn → net.TCPConn → .fd (netFD) → .pfd.Sysfd
+	ot.Offsets[GoOffTLSConnConn] = 0
+
+	// MetaHeadersFrame struct offsets (stable defaults, overridable via DWARF/buildinfo).
+	ot.Offsets[GoOffMetaFieldsPtr] = 8  // Fields.Ptr in MetaHeadersFrame
+	ot.Offsets[GoOffMetaFieldsLen] = 16 // Fields.Len in MetaHeadersFrame
+	ot.Offsets[GoOffHframeStreamID] = 8 // StreamID in FrameHeader
+	ot.Offsets[GoOffHfieldSize] = 32    // sizeof(hpack.HeaderField)
+
+	// loopyWriter/encoder probe offsets (stable defaults from Pixie).
+	ot.Offsets[GoOffLoopyWriterFramer] = 40   // loopyWriter.framer offset (google.golang.org/grpc v1.60+)
+	ot.Offsets[GoOffH2SCHpackEncoder] = 120   // http2serverConn.hpackEncoder (net/http)
+	ot.Offsets[GoOffH2SCConn] = 16            // http2serverConn.conn (net.Conn interface)
+	ot.Offsets[GoOffWriteResStreamID] = 0     // http2writeResHeaders.streamID
+	ot.Offsets[GoOffWriteResEndStream] = 4    // http2writeResHeaders.endStream
 
 	return ot
 }

@@ -39,6 +39,20 @@
 // Userspace truncation in enrichAndEmit provides an additional safety cap.
 #define MAX_DATA_SIZE 8192
 
+// Protocol-specific capture size defaults (compile-time fallbacks).
+// Used when protocol_config_map lookup fails. HTTP/2 and gRPC frames
+// are typically much smaller than HTTP/1 full payloads.
+#define DEFAULT_H1_CAPTURE_SIZE  8192
+#define DEFAULT_H2_CAPTURE_SIZE  4096
+#define DEFAULT_CAPTURE_SIZE     8192
+
+// Protocol config map key indices (protocol IDs).
+// Must match Go-side ProtocolConfigXxx constants in apiObserver.go.
+#define PROTO_CONFIG_HTTP1  0
+#define PROTO_CONFIG_HTTP2  1
+#define PROTO_CONFIG_GRPC   2
+#define PROTO_CONFIG_MAX    3
+
 // BPF loop limits
 #define MAX_IOV_SEGMENTS 8
 #define MAX_PROTOCOL_SCAN 128

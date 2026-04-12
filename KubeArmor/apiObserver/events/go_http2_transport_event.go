@@ -11,8 +11,8 @@ import (
 
 // Must match struct go_h2_transport_event in commonstructs.h.
 const (
-    GoH2MaxFields = 8
-    GoH2NameSize  = 32
+    GoH2MaxFields = 20
+    GoH2NameSize  = 128
     GoH2ValSize   = 128
 )
 
@@ -69,4 +69,45 @@ func cString(b []byte) string {
         return string(before)
     }
     return string(b)
+}
+
+// Must match HEADER_FIELD_STR_SIZE in structs.h.
+const HeaderFieldStrSize = 128
+
+// GoH2SingleHeaderEvent mirrors struct go_h2_single_header_event.
+// Emitted by hpack.WriteField and loopyWriter.writeHeader probes.
+type GoH2SingleHeaderEvent struct {
+	PID       uint32
+	StreamID  uint32
+	IsServer  uint8
+	EventType uint8 // 1=read, 2=write
+	NameLen   uint16
+	ValueLen  uint16
+	Pad       uint16
+	Name      [HeaderFieldStrSize]byte
+	Value     [HeaderFieldStrSize]byte
+}
+
+const goH2SingleHeaderEventSize = 4 + 4 + 1 + 1 + 2 + 2 + 2 + HeaderFieldStrSize + HeaderFieldStrSize
+
+// ParseGoH2SingleHeaderEvent decodes a raw ring-buffer sample into a GoH2SingleHeaderEvent.
+func ParseGoH2SingleHeaderEvent(raw []byte) (*GoH2SingleHeaderEvent, error) {
+	if len(raw) < goH2SingleHeaderEventSize {
+		return nil, fmt.Errorf("go_h2_single_header_event: short read %d < %d", len(raw), goH2SingleHeaderEventSize)
+	}
+	ev := &GoH2SingleHeaderEvent{}
+	if err := binary.Read(bytes.NewReader(raw), binary.LittleEndian, ev); err != nil {
+		return nil, fmt.Errorf("go_h2_single_header_event decode: %w", err)
+	}
+	return ev, nil
+}
+
+// HeaderName returns the decoded header name.
+func (e *GoH2SingleHeaderEvent) HeaderName() string {
+	return cString(e.Name[:])
+}
+
+// HeaderValue returns the decoded header value.
+func (e *GoH2SingleHeaderEvent) HeaderValue() string {
+	return cString(e.Value[:])
 }

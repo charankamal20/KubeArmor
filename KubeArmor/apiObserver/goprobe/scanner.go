@@ -2,8 +2,9 @@
 // Copyright 2026 Authors of KubeArmor
 
 // Package goprobe discovers Go binaries using gRPC / net/http HTTP/2
-// and resolves the symbol addresses + struct offsets needed by the
-// BPF Go HTTP/2 uprobes (go_http2_trace.h).
+// or crypto/tls and resolves the symbol addresses + struct offsets needed
+// by the BPF Go HTTP/2 uprobes (go_http2_trace.h) and Go TLS uprobes
+// (go_tls_trace.h).
 //
 // Adapted from Pixie's uprobe_manager.cc + uprobe_symaddrs.cc.
 package goprobe
@@ -55,7 +56,16 @@ const (
 	GoOffGRPCServerStreamST     = 14
 	GoOffGRPCStreamST           = 15
 	GoOffTLSConnConn            = 16
-	GoOffMax                    = 17
+	GoOffMetaFieldsPtr          = 17 // offset of Fields.Ptr in MetaHeadersFrame
+	GoOffMetaFieldsLen          = 18 // offset of Fields.Len in MetaHeadersFrame
+	GoOffHframeStreamID         = 19 // offset of StreamID in FrameHeader
+	GoOffHfieldSize             = 20 // sizeof(hpack.HeaderField)
+	GoOffLoopyWriterFramer      = 21 // loopyWriter → framer (Framer ptr)
+	GoOffH2SCHpackEncoder       = 22 // http2serverConn → hpackEncoder ptr
+	GoOffH2SCConn               = 23 // http2serverConn → conn (net.Conn iface)
+	GoOffWriteResStreamID       = 24 // http2writeResHeaders → streamID
+	GoOffWriteResEndStream      = 25 // http2writeResHeaders → endStream
+	GoOffMax                    = 26
 )
 
 // GoOffsetTable matches BPF struct go_offset_table.
@@ -89,6 +99,9 @@ type GoUProbeTarget struct {
 	Symbols map[string]uint64
 	// Offset table pushed to BPF map.
 	OffsetTable GoOffsetTable
+	// GoTlsOffsets holds crypto/tls.(*Conn).Write/Read entry+ret offsets.
+	// Nil when the binary doesn't use crypto/tls.
+	GoTlsOffsets *GoTlsOffsets
 }
 
 // TargetSymbols are the Go function symbols we want to attach uprobes to.
@@ -115,6 +128,27 @@ var TargetSymbols = map[string][]string{
 	},
 	"operate_headers_client": {
 		"google.golang.org/grpc/internal/transport.(*http2Client).operateHeaders",
+	},
+	"net_http_processHeaders": {
+		"net/http.(*http2serverConn).processHeaders",
+	},
+	"loopy_writer_write_header": {
+		"google.golang.org/grpc/internal/transport.(*loopyWriter).writeHeader",
+	},
+	"hpack_write_field": {
+		"golang.org/x/net/http2/hpack.(*Encoder).WriteField",
+	},
+	"http2_write_res_headers": {
+		"net/http.(*http2writeResHeaders).writeFrame",
+	},
+	// Go crypto/tls — entry probes only.
+	// Return probes use ret-instruction offsets (not uretprobes) and are
+	// attached separately via GoTlsOffsets. See attachGoHTTP2Uprobes.
+	"go_tls_write": {
+		"crypto/tls.(*Conn).Write",
+	},
+	"go_tls_read": {
+		"crypto/tls.(*Conn).Read",
 	},
 }
 
@@ -198,13 +232,32 @@ func ScanProc() ([]GoUProbeTarget, error) {
 			}
 		}
 
+		// Discover Go TLS ret instruction offsets for uprobe-at-ret pattern.
+		var tlsOffsets *GoTlsOffsets
+		if _, hasTLS := syms["go_tls_write"]; hasTLS {
+			offsets, tlsErr := FindGoTlsOffsets(hostPath)
+			if tlsErr != nil {
+				slog.Warn("Go TLS offset discovery failed (uretprobe fallback disabled)",
+					"path", hostPath, "err", tlsErr)
+			} else {
+				tlsOffsets = &offsets
+				slog.Info("Go TLS ret offsets discovered",
+					"path", hostPath,
+					"write_exits", len(offsets.GoWriteOffset.Exits),
+					"read_exits", len(offsets.GoReadOffset.Exits),
+					"abi", offsets.Abi,
+				)
+			}
+		}
+
 		for _, pe := range pids {
 			targets = append(targets, GoUProbeTarget{
-				PID:         pe.pid,
-				BinaryPath:  pe.hostPath,
-				Inode:       inode,
-				Symbols:     syms,
-				OffsetTable: offTable,
+				PID:          pe.pid,
+				BinaryPath:   pe.hostPath,
+				Inode:        inode,
+				Symbols:      syms,
+				OffsetTable:  offTable,
+				GoTlsOffsets: tlsOffsets,
 			})
 		}
 	}
@@ -253,12 +306,22 @@ func ScanPID(pid uint32) (*GoUProbeTarget, error) {
 		}
 	}
 
+	// Discover Go TLS ret instruction offsets.
+	var tlsOffsets *GoTlsOffsets
+	if _, hasTLS := syms["go_tls_write"]; hasTLS {
+		offsets, tlsErr := FindGoTlsOffsets(hostPath)
+		if tlsErr == nil {
+			tlsOffsets = &offsets
+		}
+	}
+
 	return &GoUProbeTarget{
-		PID:         pid,
-		BinaryPath:  hostPath,
-		Inode:       inode,
-		Symbols:     syms,
-		OffsetTable: offTable,
+		PID:          pid,
+		BinaryPath:   hostPath,
+		Inode:        inode,
+		Symbols:      syms,
+		OffsetTable:  offTable,
+		GoTlsOffsets: tlsOffsets,
 	}, nil
 }
 

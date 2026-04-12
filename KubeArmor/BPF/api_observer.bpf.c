@@ -5,6 +5,29 @@
 // 
 // api_observer.bpf.c — eBPF entry points for the API Observer.
 
+/*
+ * ARM64 cross-compilation support.
+ *
+ * MUST come before shared.h because shared.h → bpf_tracing.h uses
+ * struct user_pt_regs when bpf_target_arm64 is defined.
+ *
+ * bpf2go -target arm64 passes -D__TARGET_ARCH_arm64 to clang.
+ * bpf_tracing.h then casts PT_REGS via struct user_pt_regs.
+ * Since vmlinux.h is generated from the host kernel BTF (x86 in dev),
+ * it only defines struct pt_regs. We provide the ARM64 struct here.
+ */
+#if defined(__TARGET_ARCH_arm64) || defined(__aarch64__)
+#ifndef __USER_PT_REGS_DEFINED
+#define __USER_PT_REGS_DEFINED
+struct user_pt_regs {
+    unsigned long long regs[31];
+    unsigned long long sp;
+    unsigned long long pc;
+    unsigned long long pstate;
+};
+#endif
+#endif
+
 #include "shared.h"
 
 #include "apiobserver/common/macros.h"
@@ -15,17 +38,31 @@
 #include "apiobserver/conn_tracker.h"
 #include "apiobserver/sock_trace.h"
 #include "apiobserver/openssl_trace.h"
+#include "apiobserver/go_tls_trace.h"
 #include "apiobserver/go_http2_trace.h"
 #include "apiobserver/grpc_c_trace.h"
 
-// Go gRPC uprobes — attached to Go gRPC binaries at runtime.
+/* Kubeshark-style SSL capture infrastructure.
+ * These headers define their own SEC() entries inline. */
+#include "apiobserver/ks_ssl_common.h"
+#include "apiobserver/ks_fd_tracepoints.h"
+#include "apiobserver/ks_tcp_kprobes.h"
+#include "apiobserver/ks_connect_tracepoints.h"
+#include "apiobserver/ks_openssl_uprobes.h"
 // Probe implementations are defined inline in go_http2_trace.h using
 // goroutine-based correlation (OTel-style). They capture the gRPC
 // method/path from transport.Stream.Method after HPACK decoding.
 
+// ===================================================================
+// SSL uprobes — Strategy B: Userspace Offset FD access (Netty/BoringSSL)
+// ===================================================================
 SEC("uprobe/SSL_write")
 int uprobe_ssl_write(struct pt_regs *ctx) {
-    return handle_ssl_write(ctx);
+    return handle_ssl_write_entry(ctx);
+}
+SEC("uretprobe/SSL_write")
+int uretprobe_ssl_write(struct pt_regs *ctx) {
+    return handle_ssl_write_return(ctx);
 }
 SEC("uprobe/SSL_read")
 int uprobe_ssl_read(struct pt_regs *ctx) {
@@ -35,6 +72,57 @@ SEC("uretprobe/SSL_read")
 int uretprobe_ssl_read(struct pt_regs *ctx) {
     return handle_ssl_read_return(ctx);
 }
+
+// ===================================================================
+// SSL uprobes — Strategy A: Nested Syscall FD access (OpenSSL/Python/static)
+// ===================================================================
+SEC("uprobe/SSL_write_syscall_fd")
+int uprobe_ssl_write_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_write_syscall_fd")
+int uretprobe_ssl_write_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_return_syscall_fd(ctx);
+}
+SEC("uprobe/SSL_read_syscall_fd")
+int uprobe_ssl_read_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_read_syscall_fd")
+int uretprobe_ssl_read_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_return_syscall_fd(ctx);
+}
+
+// SSL_write_ex / SSL_read_ex — nested syscall only (OpenSSL 1.1.1+)
+SEC("uprobe/SSL_write_ex_syscall_fd")
+int uprobe_ssl_write_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_ex_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_write_ex_syscall_fd")
+int uretprobe_ssl_write_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_write_ex_return_syscall_fd(ctx);
+}
+SEC("uprobe/SSL_read_ex_syscall_fd")
+int uprobe_ssl_read_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_ex_entry_syscall_fd(ctx);
+}
+SEC("uretprobe/SSL_read_ex_syscall_fd")
+int uretprobe_ssl_read_ex_syscall_fd(struct pt_regs *ctx) {
+    return handle_ssl_read_ex_return_syscall_fd(ctx);
+}
+
+// SSL_shutdown — cleanup
+SEC("uprobe/SSL_shutdown")
+int uprobe_ssl_shutdown(struct pt_regs *ctx) {
+    return handle_ssl_shutdown(ctx);
+}
+
+// ===================================================================
+// Go crypto/tls uprobes — attached to Go binaries at runtime
+// ===================================================================
+// NOTE: SEC entries defined inline in go_tls_trace.h
+// (ka_uprobe_go_tls_write, ka_uretprobe_go_tls_write,
+//  ka_uprobe_go_tls_read, ka_uretprobe_go_tls_read)
 
 // gRPC-C uprobes — attached to libgrpc.so at runtime for Python/C++/Ruby/PHP/C# services.
 // Captures grpc_chttp2_stream.method directly from process memory, bypassing the HPACK

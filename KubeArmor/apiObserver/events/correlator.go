@@ -83,6 +83,12 @@ type Correlator interface {
 		pid, streamID uint32, hdrs map[string]string,
 	)
 
+	// InjectGoH2SingleHeader accumulates a single header field (from
+	// hpack.WriteField or loopyWriter.writeHeader probes) into the
+	// transport headers staging map. Multiple calls with the same
+	// {pid, streamID} build up the complete header set.
+	InjectGoH2SingleHeader(pid, streamID uint32, name, value string)
+
 	// InjectGRPCCEvent patches the :path for a pending HTTP/2 stream captured
 	// via gRPC-C uprobes (Python, C++, Ruby, PHP, C# services).
 	// Uses pid+fd+streamID as the lookup key; takes the mutex internally.
@@ -721,5 +727,28 @@ func (c *defaultCorrelator) InjectGoHTTP2TransportHeaders(
 		Headers:   hdrs,
 		CreatedAt: time.Now(),
 	}
+	c.transportHeadersMu.Unlock()
+}
+
+// InjectGoH2SingleHeader accumulates one header field into the transport
+// headers staging map.  Called once per header by the hpack.WriteField
+// and loopyWriter.writeHeader drain loops.
+func (c *defaultCorrelator) InjectGoH2SingleHeader(
+	pid, streamID uint32, name, value string,
+) {
+	if name == "" {
+		return
+	}
+	key := transportHeaderKey{PID: pid, StreamID: streamID}
+	c.transportHeadersMu.Lock()
+	entry, ok := c.transportHeaders[key]
+	if !ok {
+		entry = transportHeaderEntry{
+			Headers:   make(map[string]string),
+			CreatedAt: time.Now(),
+		}
+	}
+	entry.Headers[name] = value
+	c.transportHeaders[key] = entry
 	c.transportHeadersMu.Unlock()
 }

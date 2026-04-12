@@ -82,14 +82,6 @@ struct {
   __uint(max_entries, 1 * 1024 * 1024);
 } go_http2_events SEC(".maps");
 
-/* Inode → offset table (populated from userspace). */
-struct {
-  __uint(type, BPF_MAP_TYPE_HASH);
-  __uint(max_entries, 4096);
-  __type(key, u64);
-  __type(value, struct go_offset_table);
-} go_offsets_map SEC(".maps");
-
 /* Goroutine key → server invocation context. */
 struct {
   __uint(type, BPF_MAP_TYPE_LRU_HASH);
@@ -114,6 +106,30 @@ struct {
   __type(value, u16);
 } ongoing_grpc_request_status SEC(".maps");
 
+/* hpack Encoder pointer → stream context (for WriteField correlation).
+ * Set by loopyWriter.writeHeader or http2writeResHeaders.writeFrame,
+ * read by hpack.(*Encoder).WriteField. */
+struct {
+  __uint(type, BPF_MAP_TYPE_LRU_HASH);
+  __uint(max_entries, 4096);
+  __type(key, u64);  /* encoder pointer */
+  __type(value, struct go_h2_encoder_ctx);
+} go_h2_active_encoder_map SEC(".maps");
+
+/* Ring buffer for single-header events from hpack.WriteField. */
+struct {
+  __uint(type, BPF_MAP_TYPE_RINGBUF);
+  __uint(max_entries, 512 * 1024);
+} go_h2_single_header_events SEC(".maps");
+
+/* Per-CPU scratch for single-header event assembly. */
+struct {
+  __uint(type, BPF_MAP_TYPE_PERCPU_ARRAY);
+  __uint(max_entries, 1);
+  __type(key, u32);
+  __type(value, struct go_h2_single_header_event);
+} go_h2_single_header_scratch SEC(".maps");
+
 /* ---- Helpers ---- */
 
 static __always_inline void go_addr_key_init(struct go_addr_key *key,
@@ -121,23 +137,6 @@ static __always_inline void go_addr_key_init(struct go_addr_key *key,
   key->addr = (u64)goroutine;
   key->pid = (u32)(bpf_get_current_pid_tgid() >> 32);
   key->_pad = 0;
-}
-
-/*
- * Get the offset table for the current process's binary.
- * Uses the inode of the executable as key (same as OTel).
- */
-static __always_inline struct go_offset_table *get_offsets(void) {
-  struct task_struct *task = (struct task_struct *)bpf_get_current_task();
-  u64 ino = BPF_CORE_READ(task, mm, exe_file, f_inode, i_ino);
-  return (struct go_offset_table *)bpf_map_lookup_elem(&go_offsets_map, &ino);
-}
-
-static __always_inline s64 go_offset(struct go_offset_table *ot,
-                                     enum go_offset_kind kind) {
-  if (!ot || kind >= GO_OFF_MAX)
-    return -1;
-  return ot->offsets[kind];
 }
 
 /*
@@ -506,7 +505,8 @@ done:
 
 // operateHeaders helpers
 
-// MetaHeadersFrame fixed offsets (golang.org/x/net/http2, stable since Go 1.9)
+// Default MetaHeadersFrame offsets (golang.org/x/net/http2, stable since Go 1.9)
+// These are used as fallbacks if the offset table is unavailable.
 //   offset  0: *HeadersFrame  (8 bytes)
 //   offset  8: Fields.Ptr     (8 bytes) ← slice data pointer to
 //   []hpack.HeaderField offset 16: Fields.Len     (8 bytes) offset 24:
@@ -519,10 +519,11 @@ done:
 //   offset  0: Name.Ptr  (8)  Name.Len  (8)
 //   offset 16: Value.Ptr (8)  Value.Len (8)
 
-#define META_FIELDS_PTR_OFF 8
-#define META_FIELDS_LEN_OFF 16
-#define HFRAME_STREAM_ID_OFF 8
-#define HFIELD_SIZE 32
+// Hardcoded defaults (used when offset table entry is -1 or unavailable).
+#define META_FIELDS_PTR_OFF_DEFAULT 8
+#define META_FIELDS_LEN_OFF_DEFAULT 16
+#define HFRAME_STREAM_ID_OFF_DEFAULT 8
+#define HFIELD_SIZE_DEFAULT 32
 #define HFIELD_NAME_PTR_OFF 0
 #define HFIELD_NAME_LEN_OFF 8
 #define HFIELD_VAL_PTR_OFF 16
@@ -534,6 +535,25 @@ static __always_inline int __emit_operate_headers(struct pt_regs *ctx,
   if (!frame_ptr)
     return 0;
 
+  /* Resolve configurable offsets from the BPF map, with fallbacks. */
+  struct go_offset_table *ot = get_offsets();
+  __u64 meta_fields_ptr_off = META_FIELDS_PTR_OFF_DEFAULT;
+  __u64 meta_fields_len_off = META_FIELDS_LEN_OFF_DEFAULT;
+  __u64 hframe_stream_id_off = HFRAME_STREAM_ID_OFF_DEFAULT;
+  __u64 hfield_size = HFIELD_SIZE_DEFAULT;
+
+  if (ot) {
+    s64 v;
+    v = go_offset(ot, GO_OFF_META_FIELDS_PTR);
+    if (v >= 0) meta_fields_ptr_off = (__u64)v;
+    v = go_offset(ot, GO_OFF_META_FIELDS_LEN);
+    if (v >= 0) meta_fields_len_off = (__u64)v;
+    v = go_offset(ot, GO_OFF_HFRAME_STREAM_ID);
+    if (v >= 0) hframe_stream_id_off = (__u64)v;
+    v = go_offset(ot, GO_OFF_HFIELD_SIZE);
+    if (v > 0) hfield_size = (__u64)v;
+  }
+
   __u64 hframe_ptr = 0;
   if (bpf_probe_read_user(&hframe_ptr, sizeof(hframe_ptr), frame_ptr) != 0 ||
       !hframe_ptr)
@@ -541,14 +561,14 @@ static __always_inline int __emit_operate_headers(struct pt_regs *ctx,
 
   __u32 stream_id = 0;
   if (bpf_probe_read_user(&stream_id, sizeof(stream_id),
-                          (void *)(hframe_ptr + HFRAME_STREAM_ID_OFF)) != 0)
+                          (void *)(hframe_ptr + hframe_stream_id_off)) != 0)
     return 0;
 
   __u64 fields_ptr = 0, fields_len = 0;
   bpf_probe_read_user(&fields_ptr, sizeof(fields_ptr),
-                      (void *)((__u64)frame_ptr + META_FIELDS_PTR_OFF));
+                      (void *)((__u64)frame_ptr + meta_fields_ptr_off));
   bpf_probe_read_user(&fields_len, sizeof(fields_len),
-                      (void *)((__u64)frame_ptr + META_FIELDS_LEN_OFF));
+                      (void *)((__u64)frame_ptr + meta_fields_len_off));
   if (!fields_ptr || !fields_len)
     return 0;
 
@@ -578,7 +598,7 @@ static __always_inline int __emit_operate_headers(struct pt_regs *ctx,
     if ((__u64)i >= n)
       continue;
 
-    __u64 foff = fields_ptr + (__u64)i * HFIELD_SIZE;
+    __u64 foff = fields_ptr + (__u64)i * hfield_size;
 
     __u64 nptr = 0, nlen = 0, vptr = 0, vlen = 0;
     bpf_probe_read_user(&nptr, sizeof(nptr),
@@ -596,7 +616,7 @@ static __always_inline int __emit_operate_headers(struct pt_regs *ctx,
     bpf_probe_read_user_str(ev->fields[i].name, GO_H2_NAME_SIZE, (void *)nptr);
     if (vptr && vlen > 0 && vlen < GO_H2_VAL_SIZE)
       bpf_probe_read_user_str(ev->fields[i].value, GO_H2_VAL_SIZE,
-                              (void *)vptr);
+                               (void *)vptr);
 
     ev->field_count++;
   }
@@ -622,4 +642,210 @@ int ka_uprobe_operate_headers_server(struct pt_regs *ctx) {
 SEC("uprobe/operate_headers_client")
 int ka_uprobe_operate_headers_client(struct pt_regs *ctx) {
   return __emit_operate_headers(ctx, 0);
+}
+
+// uprobe:
+// net/http.(*http2serverConn).processHeaders
+// Handles incoming HTTP/2 headers in Go's stdlib net/http HTTP/2 server.
+// The net/http.http2MetaHeadersFrame is a vendored copy of
+// golang.org/x/net/http2.MetaHeadersFrame with identical layout.
+SEC("uprobe/net_http_processHeaders")
+int ka_uprobe_net_http_processHeaders(struct pt_regs *ctx) {
+  return __emit_operate_headers(ctx, 1);
+}
+
+// =====================================================================
+// hpack Encoder probes — outgoing header capture
+// Adapted from Pixie's go_http2_trace.c (proven stable go1.6–go1.24)
+// =====================================================================
+
+// Helper: emit a single header field via the ring buffer.
+static __always_inline void __emit_single_header(
+    __u32 pid, __u32 stream_id, __u8 is_server, __u8 event_type,
+    void *name_ptr, u64 name_len, void *value_ptr, u64 value_len) {
+  __u32 zero = 0;
+  struct go_h2_single_header_event *ev =
+      bpf_map_lookup_elem(&go_h2_single_header_scratch, &zero);
+  if (!ev)
+    return;
+
+  ev->pid = pid;
+  ev->stream_id = stream_id;
+  ev->is_server = is_server;
+  ev->event_type = event_type;
+  ev->_pad = 0;
+
+  // Clamp and copy name
+  u64 nlen = name_len < HEADER_FIELD_STR_SIZE ? name_len : HEADER_FIELD_STR_SIZE - 1;
+  ev->name_len = (__u16)nlen;
+  ev->name[0] = '\0';
+  if (name_ptr && nlen > 0)
+    bpf_probe_read_user_str(ev->name, HEADER_FIELD_STR_SIZE, name_ptr);
+
+  // Clamp and copy value
+  u64 vlen = value_len < HEADER_FIELD_STR_SIZE ? value_len : HEADER_FIELD_STR_SIZE - 1;
+  ev->value_len = (__u16)vlen;
+  ev->value[0] = '\0';
+  if (value_ptr && vlen > 0)
+    bpf_probe_read_user_str(ev->value, HEADER_FIELD_STR_SIZE, value_ptr);
+
+  bpf_ringbuf_output(&go_h2_single_header_events, ev, sizeof(*ev), 0);
+}
+
+// uprobe: google.golang.org/grpc/internal/transport.(*loopyWriter).writeHeader
+//
+// Captures outgoing gRPC headers. Iterates the []hpack.HeaderField array
+// and emits each field. Also sets up the encoder→stream_id correlation
+// for the subsequent hpack.WriteField calls.
+//
+// func (l *loopyWriter) writeHeader(streamID uint32, endStream bool,
+//                                   hf []hpack.HeaderField, onWrite func()) error
+SEC("uprobe/loopy_writer_write_header")
+int ka_uprobe_loopy_writer_write_header(struct pt_regs *ctx) {
+  // Go register ABI (go1.17+):
+  //   param1 (l *loopyWriter) → AX
+  //   param2 (streamID uint32)→ BX
+  //   param3 (endStream bool)  → CX (low byte)
+  //   param4 (hf.ptr)          → DI
+  //   param5 (hf.len)          → SI
+  //   param6 (hf.cap)          → R8
+  //   param7 (onWrite func())  → R9
+  void *loopy_writer_ptr = GO_PARAM1(ctx);
+  __u32 stream_id = (__u32)(u64)GO_PARAM2(ctx);
+  void *fields_ptr = GO_PARAM4(ctx);
+  u64 fields_len = (u64)GO_PARAM5(ctx);
+
+  if (!loopy_writer_ptr || !fields_ptr || fields_len == 0)
+    return 0;
+
+  __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+
+  // Read configurable offsets
+  struct go_offset_table *ot = get_offsets();
+
+  __u64 hfield_size = HFIELD_SIZE_DEFAULT;
+  if (ot) {
+    s64 v = go_offset(ot, GO_OFF_HFIELD_SIZE);
+    if (v > 0) hfield_size = (__u64)v;
+  }
+
+  // Emit each header field
+  u64 n = fields_len < GO_H2_MAX_FIELDS ? fields_len : GO_H2_MAX_FIELDS;
+
+  #pragma unroll
+  for (int i = 0; i < GO_H2_MAX_FIELDS; i++) {
+    if ((__u64)i >= n)
+      break;
+
+    __u64 foff = (u64)fields_ptr + (__u64)i * hfield_size;
+
+    u64 nptr = 0, nlen = 0, vptr = 0, vlen = 0;
+    bpf_probe_read_user(&nptr, sizeof(nptr), (void *)(foff + HFIELD_NAME_PTR_OFF));
+    bpf_probe_read_user(&nlen, sizeof(nlen), (void *)(foff + HFIELD_NAME_LEN_OFF));
+    bpf_probe_read_user(&vptr, sizeof(vptr), (void *)(foff + HFIELD_VAL_PTR_OFF));
+    bpf_probe_read_user(&vlen, sizeof(vlen), (void *)(foff + HFIELD_VAL_LEN_OFF));
+
+    if (!nptr || !nlen)
+      continue;
+
+    // event_type=2 → write (outgoing)
+    __emit_single_header(pid, stream_id, 0, 2,
+                         (void *)nptr, nlen, (void *)vptr, vlen);
+  }
+
+  return 0;
+}
+
+// uprobe: golang.org/x/net/http2/hpack.(*Encoder).WriteField
+//
+// Captures individual header fields during HPACK encoding.
+// Correlates with the encoder context set by writeFrame/writeHeader.
+//
+// func (e *Encoder) WriteField(f HeaderField) error
+// Go register ABI:
+//   param1 (e *Encoder)      → AX
+//   param2 (f.Name.ptr)      → BX
+//   param3 (f.Name.len)      → CX
+//   param4 (f.Value.ptr)     → DI
+//   param5 (f.Value.len)     → SI
+// Verified stable from go1.6 to go1.24 (from Pixie).
+SEC("uprobe/hpack_write_field")
+int ka_uprobe_hpack_write_field(struct pt_regs *ctx) {
+  u64 encoder_ptr = (u64)GO_PARAM1(ctx);
+  if (!encoder_ptr)
+    return 0;
+
+  // Look up the encoder context (set by writeFrame or loopyWriter probe)
+  struct go_h2_encoder_ctx *enc_ctx =
+      bpf_map_lookup_elem(&go_h2_active_encoder_map, &encoder_ptr);
+  if (!enc_ctx)
+    return 0;
+
+  // Extract name and value Go strings from registers
+  void *name_ptr = GO_PARAM2(ctx);
+  u64 name_len = (u64)GO_PARAM3(ctx);
+  void *value_ptr = GO_PARAM4(ctx);
+  u64 value_len = (u64)GO_PARAM5(ctx);
+
+  if (!name_ptr || name_len == 0)
+    return 0;
+
+  // event_type=2 → write (outgoing)
+  __emit_single_header(enc_ctx->pid, enc_ctx->stream_id, 0, 2,
+                       name_ptr, name_len, value_ptr, value_len);
+  return 0;
+}
+
+// uprobe: net/http.(*http2writeResHeaders).writeFrame
+//
+// Sets up hpack encoder → stream_id correlation for net/http HTTP/2
+// response headers. The hpack Encoder will call WriteField for each
+// header, and we'll join them via the encoder pointer.
+//
+// func (w *http2writeResHeaders) writeFrame(ctx http2writeContext) error
+// Go register ABI:
+//   param1 (w *http2writeResHeaders) → AX
+//   param2 (ctx.type)                 → BX
+//   param3 (ctx.ptr → *http2serverConn) → CX
+SEC("uprobe/http2_write_res_headers")
+int ka_uprobe_http2_write_res_headers(struct pt_regs *ctx) {
+  void *w_ptr = GO_PARAM1(ctx);      // *http2writeResHeaders
+  void *sc_ptr = GO_PARAM3(ctx);     // *http2serverConn (interface data ptr)
+
+  if (!w_ptr || !sc_ptr)
+    return 0;
+
+  struct go_offset_table *ot = get_offsets();
+  if (!ot)
+    return 0;
+
+  // Read stream_id from http2writeResHeaders
+  s64 sid_off = go_offset(ot, GO_OFF_WRITE_RES_STREAM_ID);
+  if (sid_off < 0)
+    return 0;
+
+  __u32 stream_id = 0;
+  if (bpf_probe_read_user(&stream_id, sizeof(stream_id),
+                          (void *)((u64)w_ptr + (u64)sid_off)) != 0)
+    return 0;
+
+  // Read hpack encoder pointer from http2serverConn
+  s64 henc_off = go_offset(ot, GO_OFF_H2SC_HPACK_ENCODER);
+  if (henc_off < 0)
+    return 0;
+
+  u64 henc_ptr = 0;
+  if (bpf_probe_read_user(&henc_ptr, sizeof(henc_ptr),
+                          (void *)((u64)sc_ptr + (u64)henc_off)) != 0 || !henc_ptr)
+    return 0;
+
+  // Store encoder → {pid, stream_id} for WriteField correlation
+  __u32 pid = (__u32)(bpf_get_current_pid_tgid() >> 32);
+  struct go_h2_encoder_ctx enc_ctx = {
+    .pid = pid,
+    .stream_id = stream_id,
+  };
+  bpf_map_update_elem(&go_h2_active_encoder_map, &henc_ptr, &enc_ctx, BPF_ANY);
+
+  return 0;
 }

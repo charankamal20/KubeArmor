@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"syscall"
@@ -18,6 +19,7 @@ import (
 	pb "github.com/accuknox/SentryFlow/protobuf/golang"
 	"github.com/cilium/ebpf"
 	"github.com/cilium/ebpf/link"
+	"github.com/cilium/ebpf/perf"
 	"github.com/cilium/ebpf/ringbuf"
 	"github.com/cilium/ebpf/rlimit"
 
@@ -31,7 +33,7 @@ import (
 	tp "github.com/kubearmor/KubeArmor/KubeArmor/types"
 )
 
-//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64 -cc clang apiObserver ../BPF/api_observer.bpf.c
+//go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64,arm64 -cc clang apiObserver ../BPF/api_observer.bpf.c
 
 // APIObserver captures and processes network events via eBPF.
 type APIObserver struct {
@@ -55,6 +57,13 @@ type APIObserver struct {
 
 	goH2TransportEvents  *ringbuf.Reader
 	goH2TransportChannel chan []byte
+
+	// Per-field header events from hpack.WriteField / loopyWriter.writeHeader.
+	goH2SingleHeaderEvents  *ringbuf.Reader
+	goH2SingleHeaderChannel chan []byte
+
+	// Kubeshark-style TLS chunk perf reader (ks_chunks_buffer).
+	ksTlsChunksReader *perf.Reader
 
 	// Pipeline components.
 	filterer    *filter.Filterer
@@ -95,6 +104,9 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 	}
 	ao.Logger.Print("API Observer eBPF objects loaded successfully")
 
+	// Populate protocol-aware capture size limits.
+	ao.populateProtocolConfig()
+
 	if err = ao.attachTracepoint(); err != nil {
 		ao.Logger.Warnf("Failed to attach tracepoint (connection tracking degraded): %v", err)
 	}
@@ -102,6 +114,13 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 	if err = ao.attachKprobes(); err != nil {
 		ao.Logger.Warnf("Failed to initialize system api observer: %s", err.Error())
 		return nil, err
+	}
+
+	// Attach kubeshark-style FD resolution tracepoints, TCP kprobes, and
+	// connect/accept tracepoints. These are REQUIRED for SSL capture —
+	// without them, ks_ssl_info.fd stays at -1 and all chunks are dropped.
+	if err = ao.attachKsFdTracepoints(); err != nil {
+		ao.Logger.Warnf("KS FD tracepoints partially failed (SSL capture degraded): %v", err)
 	}
 
 	ao.Events, err = ringbuf.NewReader(ao.objs.ApiobserverEvents)
@@ -135,11 +154,32 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 		ao.Logger.Print("Go HTTP/2 transport events ring buffer created")
 	}
 
+	ao.goH2SingleHeaderEvents, err = ringbuf.NewReader(ao.objs.GoH2SingleHeaderEvents)
+	if err != nil {
+		ao.Logger.Warnf("Go HTTP/2 single-header events ring buffer not available (hpack probes disabled): %v", err)
+	} else {
+		ao.goH2SingleHeaderChannel = make(chan []byte, 4096)
+		ao.Logger.Print("Go HTTP/2 single-header events ring buffer created")
+	}
+
 	go ao.TraceEvents()
 	go ao.flushLoop()
 
 	// Start background Go HTTP/2 uprobe scanner.
 	go ao.attachGoHTTP2Uprobes()
+
+	// Start background SSL uprobe scanner for HTTPS traffic capture.
+	go ao.attachSSLUprobes()
+
+	// Kubeshark-style TLS chunks perf reader.
+	ksPerfReader, err := perf.NewReader(ao.objs.KsChunksBuffer, 4096*128)
+	if err != nil {
+		ao.Logger.Warnf("KS TLS perf reader not available: %v", err)
+	} else {
+		ao.ksTlsChunksReader = ksPerfReader
+		ao.Logger.Print("Kubeshark-style TLS chunk perf reader created")
+		go ao.drainKsTlsChunks()
+	}
 
 	ao.grpccEvents, err = ringbuf.NewReader(ao.objs.GrpccEvents)
 	if err != nil {
@@ -216,6 +256,98 @@ func (ao *APIObserver) attachSyscallKretprobe(x64name, fallback string, prog *eb
 	}
 	ao.links = append(ao.links, kp)
 	ao.Logger.Printf("Kretprobe %s attached (FD lifecycle)", fallback)
+}
+
+// attachKsFdTracepoints attaches the kubeshark-ported BPF programs that are
+// required for SSL/TLS capture. Three categories:
+//
+//  1. FD tracepoints (ks_fd_tracepoints.h) — sys_enter_read/write/sendto/recvfrom
+//     and sys_exit_read/write. These populate the FD field in ks_ssl_info when
+//     SSL_write/SSL_read internally calls write()/read(). Without these, all
+//     SSL chunks are dropped because info.fd == ks_invalid_fd.
+//
+//  2. Connect/accept tracepoints (ks_connect_tracepoints.h) — sys_enter/exit
+//     for connect and accept4. These populate the ks_connection_context map
+//     that tracks whether a connection is client or server side.
+//
+//  3. TCP kprobes (ks_tcp_kprobes.h) — tcp_sendmsg/tcp_recvmsg. These populate
+//     the source/destination IP+port in ks_ssl_info from struct sock.
+func (ao *APIObserver) attachKsFdTracepoints() error {
+	var firstErr error
+
+	// FD resolution tracepoints.
+	fdTracepoints := []struct {
+		group, name string
+		prog        *ebpf.Program
+	}{
+		{"syscalls", "sys_enter_read", ao.objs.KsSysEnterRead},
+		{"syscalls", "sys_enter_write", ao.objs.KsSysEnterWrite},
+		{"syscalls", "sys_enter_recvfrom", ao.objs.KsSysEnterRecvfrom},
+		{"syscalls", "sys_enter_sendto", ao.objs.KsSysEnterSendto},
+		{"syscalls", "sys_exit_read", ao.objs.KsSysExitRead},
+		{"syscalls", "sys_exit_write", ao.objs.KsSysExitWrite},
+	}
+
+	for _, tp := range fdTracepoints {
+		l, err := link.Tracepoint(tp.group, tp.name, tp.prog, nil)
+		if err != nil {
+			ao.Logger.Warnf("KS FD tracepoint %s/%s failed: %v", tp.group, tp.name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		ao.links = append(ao.links, l)
+		ao.Logger.Printf("KS FD tracepoint %s attached", tp.name)
+	}
+
+	// Connect/accept tracepoints.
+	connTracepoints := []struct {
+		group, name string
+		prog        *ebpf.Program
+	}{
+		{"syscalls", "sys_enter_accept4", ao.objs.KsSysEnterAccept4},
+		{"syscalls", "sys_exit_accept4", ao.objs.KsSysExitAccept4},
+		{"syscalls", "sys_enter_connect", ao.objs.KsSysEnterConnect},
+		{"syscalls", "sys_exit_connect", ao.objs.KsSysExitConnect},
+	}
+
+	for _, tp := range connTracepoints {
+		l, err := link.Tracepoint(tp.group, tp.name, tp.prog, nil)
+		if err != nil {
+			ao.Logger.Warnf("KS connect tracepoint %s/%s failed: %v", tp.group, tp.name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		ao.links = append(ao.links, l)
+		ao.Logger.Printf("KS connect tracepoint %s attached", tp.name)
+	}
+
+	// TCP kprobes for address resolution.
+	tcpKprobes := []struct {
+		name string
+		prog *ebpf.Program
+	}{
+		{"tcp_sendmsg", ao.objs.KsKprobeTcpSendmsg},
+		{"tcp_recvmsg", ao.objs.KsKprobeTcpRecvmsg},
+	}
+
+	for _, kp := range tcpKprobes {
+		l, err := link.Kprobe(kp.name, kp.prog, nil)
+		if err != nil {
+			ao.Logger.Warnf("KS TCP kprobe %s failed: %v", kp.name, err)
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		ao.links = append(ao.links, l)
+		ao.Logger.Printf("KS TCP kprobe %s attached", kp.name)
+	}
+
+	return firstErr
 }
 
 // Event loop
@@ -584,39 +716,285 @@ func (ao *APIObserver) resolveWorkload(ip string) (name, namespace string) {
 	return ip, ""
 }
 
-// SSL uprobes -> currently not being called. In Progress
-func (ao *APIObserver) attachSSLUprobes() error {
-	libPaths, err := ssl.LibSSLPaths()
-	if err != nil {
-		ao.Logger.Warnf("libssl not found, HTTPS capture disabled: %v", err)
-		return nil
+// sslProbeKey tracks probed SSL libraries by (path, inode) to avoid re-probing.
+type sslProbeKey struct {
+	inode uint64 // eBPF uprobes are per-inode; dedup by inode only (like kubeshark)
+}
+
+// sslPidInfo tracks per-PID lifecycle state for SSL uprobe cleanup.
+type sslPidInfo struct {
+	pid       int
+	startTime uint64
+	links     []link.Link
+}
+
+// SSL uprobes — per-PID library discovery with dual FD strategies.
+// Runs as a background goroutine, scanning /proc for SSL libraries every 30s.
+func (ao *APIObserver) attachSSLUprobes() {
+	ao.wg.Add(1)
+	defer ao.wg.Done()
+
+	probed := make(map[sslProbeKey]bool)
+	tracked := make(map[uint64]*sslPidInfo) // keyed by (pid<<16 | startTime&0xFFFF)
+
+	// Ensure all per-PID uprobe links are closed when this goroutine exits.
+	defer func() {
+		for _, info := range tracked {
+			for _, l := range info.links {
+				l.Close()
+			}
+		}
+	}()
+
+	// Also pre-attach host-level libssl for ephemeral processes (curl etc).
+	ao.attachHostSSLUprobes(probed)
+
+	scanAndAttach := func() {
+		pids, err := ssl.ListContainerPIDs()
+		if err != nil {
+			ao.Logger.Warnf("SSL: container PID scan error: %v", err)
+			return
+		}
+
+		ao.Logger.Debugf("SSL scanner: found %d container PIDs", len(pids))
+
+		for _, pid := range pids {
+			matches := ssl.DiscoverSSLLibsForPID(pid)
+			if len(matches) > 0 {
+				ao.Logger.Debugf("SSL scanner: PID %d has %d SSL lib matches", pid, len(matches))
+			}
+			for _, m := range matches {
+				inode := ao.getFileInode(m.LibSSLPath)
+				if inode == 0 {
+					ao.Logger.Debugf("SSL scanner: could not get inode for %s (PID %d)", m.LibSSLPath, pid)
+					continue
+				}
+				key := sslProbeKey{inode: inode}
+				if probed[key] {
+					continue
+				}
+
+				ao.Logger.Debugf("SSL scanner: attaching probes to %s (PID %d, matcher=%q, strategy=%d)",
+					m.LibSSLPath, pid, m.Matcher.LibSSL, m.Matcher.SocketFDAccess)
+
+				links := ao.attachSSLProbesForMatch(m)
+				if len(links) == 0 {
+					ao.Logger.Debugf("SSL scanner: no probes attached for %s (PID %d) — symbols not found?",
+						m.LibSSLPath, pid)
+					continue
+				}
+
+				probed[key] = true
+
+				// Track for lifecycle management.
+				startTime, _ := ssl.GetProcStartTime(pid)
+				pidKey := (uint64(pid) << 16) | (startTime & 0xFFFF)
+				info, ok := tracked[pidKey]
+				if !ok {
+					info = &sslPidInfo{pid: pid, startTime: startTime}
+					tracked[pidKey] = info
+				}
+				for _, l := range links {
+					info.links = append(info.links, l)
+				}
+
+				ao.Logger.Printf("SSL uprobes attached to %s (PID %d, strategy=%d, %d probes)",
+					m.LibSSLPath, pid, m.Matcher.SocketFDAccess, len(links))
+			}
+		}
+
+		// Cleanup dead PIDs.
+		ao.cleanupDeadSSLPIDs(tracked)
 	}
-	for _, libPath := range libPaths {
-		offsets, err := ssl.OffsetsForLib(libPath)
-		if err != nil {
-			ao.Logger.Warnf("SSL struct offsets unknown for %s: %v", libPath, err)
-			continue
+
+	// Initial scan.
+	scanAndAttach()
+
+	// Periodic rescan.
+	ticker := time.NewTicker(30 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ao.ctx.Done():
+			return
+		case <-ticker.C:
+			scanAndAttach()
 		}
-		if err := ao.objs.SslSymaddrs.Put(uint32(0), offsets); err != nil {
-			return fmt.Errorf("ssl_symaddrs update: %w", err)
-		}
-		ex, err := link.OpenExecutable(libPath)
-		if err != nil {
-			return fmt.Errorf("open %s: %w", libPath, err)
-		}
-		if l, err := attachUprobeWithFallback(ex, "SSL_write", ao.objs.UprobeSslWrite, 0); err == nil {
-			ao.links = append(ao.links, l)
-			ao.Logger.Printf("uprobe/SSL_write attached (%s)", libPath)
-		}
-		if lEntry, err := attachUprobeWithFallback(ex, "SSL_read", ao.objs.UprobeSslRead, 0); err == nil {
-			ao.links = append(ao.links, lEntry)
-			if lRet, err := ex.Uretprobe("SSL_read", ao.objs.UretprobeSslRead, nil); err == nil {
-				ao.links = append(ao.links, lRet)
-				ao.Logger.Printf("uprobe+uretprobe/SSL_read attached (%s)", libPath)
+	}
+}
+
+// attachHostSSLUprobes pre-attaches SSL uprobes to host-level libssl libraries.
+// This captures traffic from ephemeral processes (curl, wget) that exit before
+// the per-PID scanner runs.
+func (ao *APIObserver) attachHostSSLUprobes(probed map[sslProbeKey]bool) {
+	// glob-based host library search
+	libSSLGlobs := []string{
+		"/usr/lib/x86_64-linux-gnu/libssl.so.*",
+		"/usr/lib/aarch64-linux-gnu/libssl.so.*",
+		"/usr/lib64/libssl.so.*",
+		"/usr/lib/libssl.so.*",
+		"/lib/x86_64-linux-gnu/libssl.so.*",
+		"/lib64/libssl.so.*",
+		"/usr/local/lib/libssl.so.*",
+		"/usr/local/lib64/libssl.so.*",
+	}
+
+	for _, pattern := range libSSLGlobs {
+		globMatches, _ := filepath.Glob(pattern)
+		for _, libPath := range globMatches {
+			inode := ao.getFileInode(libPath)
+			if inode == 0 {
+				continue
+			}
+			key := sslProbeKey{inode: inode}
+			if probed[key] {
+				continue
+			}
+
+			match := ssl.SSLLibMatch{
+				LibSSLPath: libPath,
+				PID:        0, // host-level
+				Matcher: ssl.SSLLibMatcher{
+					SocketFDAccess: ssl.SSLFDNestedSyscall, // host OpenSSL uses nested syscalls
+				},
+			}
+			links := ao.attachSSLProbesForMatch(match)
+			if len(links) > 0 {
+				probed[key] = true
+				// Host-level links are added directly to ao.links for lifecycle.
+				for _, l := range links {
+					ao.links = append(ao.links, l)
+				}
+				ao.Logger.Printf("Host SSL uprobes attached to %s (%d probes)", libPath, len(links))
 			}
 		}
 	}
-	return nil
+}
+
+// attachSSLProbesForMatch attaches the appropriate SSL uprobe/uretprobe pairs
+// for a given library match, choosing the correct BPF programs based on the
+// FD access strategy.
+func (ao *APIObserver) attachSSLProbesForMatch(m ssl.SSLLibMatch) []link.Link {
+	ex, err := link.OpenExecutable(m.LibSSLPath)
+	if err != nil {
+		ao.Logger.Warnf("SSL: failed to open %s: %v", m.LibSSLPath, err)
+		return nil
+	}
+
+	var links []link.Link
+	isStaticSSL := m.Matcher.SearchType == ssl.MatchExecutable
+
+	// Kubeshark-style probes: clean entry/return pattern with
+	// FD resolution via syscall tracepoints + address via tcp kprobes.
+	links = append(links, ao.attachSSLProbePair(ex, m.LibSSLPath,
+		"SSL_write", ao.objs.KsSslWrite, ao.objs.KsSslRetWrite, isStaticSSL)...)
+	links = append(links, ao.attachSSLProbePair(ex, m.LibSSLPath,
+		"SSL_read", ao.objs.KsSslRead, ao.objs.KsSslRetRead, isStaticSSL)...)
+	links = append(links, ao.attachSSLProbePair(ex, m.LibSSLPath,
+		"SSL_write_ex", ao.objs.KsSslWriteEx, ao.objs.KsSslRetWriteEx, isStaticSSL)...)
+	links = append(links, ao.attachSSLProbePair(ex, m.LibSSLPath,
+		"SSL_read_ex", ao.objs.KsSslReadEx, ao.objs.KsSslRetReadEx, isStaticSSL)...)
+
+	// SSL_pending — proactive context capture for double-read pattern.
+	if l, err := attachUprobeWithFallback(ex, "SSL_pending", ao.objs.KsSslPending, 0); err == nil {
+		links = append(links, l)
+	} else if isStaticSSL {
+		if addr, ok := ssl.ELFSymbolAddress(m.LibSSLPath, "SSL_pending"); ok {
+			if l, err := ex.Uprobe("", ao.objs.KsSslPending, &link.UprobeOptions{Address: addr}); err == nil {
+				links = append(links, l)
+			}
+		}
+	}
+
+	// SSL_shutdown — always attach for cleanup.
+	if l, err := attachUprobeWithFallback(ex, "SSL_shutdown", ao.objs.UprobeSslShutdown, 0); err == nil {
+		links = append(links, l)
+	} else if isStaticSSL {
+		if addr, ok := ssl.ELFSymbolAddress(m.LibSSLPath, "SSL_shutdown"); ok {
+			if l, err := ex.Uprobe("", ao.objs.UprobeSslShutdown, &link.UprobeOptions{Address: addr}); err == nil {
+				links = append(links, l)
+			}
+		}
+	}
+
+	return links
+}
+
+// attachSSLProbePair attaches a uprobe+uretprobe pair for a given symbol.
+// If resolveAddr is true, falls back to ELF symbol address resolution for
+// statically-linked binaries (e.g. Node.js) where cilium/ebpf can't resolve
+// symbols by name.
+// Returns attached links (0-2). Failures are logged but not fatal.
+func (ao *APIObserver) attachSSLProbePair(
+	ex *link.Executable, libPath, sym string,
+	entryProg, retProg *ebpf.Program,
+	resolveAddr bool,
+) []link.Link {
+	var links []link.Link
+
+	if entryProg != nil {
+		if l, err := attachUprobeWithFallback(ex, sym, entryProg, 0); err == nil {
+			links = append(links, l)
+		} else if resolveAddr {
+			// Try address-based attachment for static symbols
+			if addr, ok := ssl.ELFSymbolAddress(libPath, sym); ok {
+				if l, err := ex.Uprobe("", entryProg, &link.UprobeOptions{Address: addr}); err == nil {
+					links = append(links, l)
+					ao.Logger.Debugf("SSL: uprobe/%s on %s via address 0x%x", sym, libPath, addr)
+				} else {
+					ao.Logger.Debugf("SSL: uprobe/%s on %s via address 0x%x failed: %v", sym, libPath, addr, err)
+				}
+			}
+		} else {
+			ao.Logger.Debugf("SSL: uprobe/%s on %s: %v", sym, libPath, err)
+		}
+	}
+	if retProg != nil {
+		l, err := ex.Uretprobe(sym, retProg, nil)
+		if err == nil {
+			links = append(links, l)
+		} else if resolveAddr {
+			// Try address-based uretprobe for static symbols
+			if addr, ok := ssl.ELFSymbolAddress(libPath, sym); ok {
+				if l, err := ex.Uretprobe("", retProg, &link.UprobeOptions{Address: addr}); err == nil {
+					links = append(links, l)
+					ao.Logger.Debugf("SSL: uretprobe/%s on %s via address 0x%x", sym, libPath, addr)
+				} else {
+					ao.Logger.Debugf("SSL: uretprobe/%s on %s via address 0x%x failed: %v", sym, libPath, addr, err)
+				}
+			}
+		} else {
+			ao.Logger.Debugf("SSL: uretprobe/%s on %s: %v", sym, libPath, err)
+		}
+	}
+
+	return links
+}
+
+// cleanupDeadSSLPIDs removes uprobe links and BPF map entries for dead processes.
+func (ao *APIObserver) cleanupDeadSSLPIDs(tracked map[uint64]*sslPidInfo) {
+	for key, info := range tracked {
+		if ssl.PidExists(info.pid) {
+			continue
+		}
+		// Process is dead — close uprobe links.
+		for _, l := range info.links {
+			l.Close()
+		}
+		// Remove per-TGID BPF map entries.
+		ao.objs.SslSymaddrs.Delete(uint32(info.pid))
+		delete(tracked, key)
+		ao.Logger.Printf("SSL: cleaned up dead PID %d", info.pid)
+	}
+}
+
+// getFileInode returns the inode of a file, or 0 on error.
+func (ao *APIObserver) getFileInode(path string) uint64 {
+	var stat syscall.Stat_t
+	if err := syscall.Stat(path, &stat); err != nil {
+		return 0
+	}
+	return stat.Ino
 }
 
 // attachGoHTTP2Uprobes scans for Go HTTP/2 binaries and attaches uprobes.
@@ -626,7 +1004,8 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 	defer ao.wg.Done()
 
 	// Map of uprobe short IDs → BPF programs.
-	// For uretprobes, the key gets a "_ret" suffix.
+	// For uretprobes (non-Go functions only), the key gets a "_ret" suffix.
+	// Go TLS ret probes use a separate path — see GoTlsOffsets below.
 	probeMap := map[string]*ebpf.Program{
 		"server_handleStream":      ao.objs.KaUprobeServerHandleStream,
 		"server_handleStream_ret":  ao.objs.KaUretprobeServerHandleStream,
@@ -637,6 +1016,14 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 		"clientStream_RecvMsg_ret": ao.objs.KaUretprobeClientStreamRecvMsg,
 		"operate_headers_server":   ao.objs.KaUprobeOperateHeadersServer,
 		"operate_headers_client":   ao.objs.KaUprobeOperateHeadersClient,
+		"net_http_processHeaders":  ao.objs.KaUprobeNetHttpProcessHeaders,
+		"loopy_writer_write_header": ao.objs.KaUprobeLoopyWriterWriteHeader,
+		"hpack_write_field":        ao.objs.KaUprobeHpackWriteField,
+		"http2_write_res_headers":  ao.objs.KaUprobeHttp2WriteResHeaders,
+		// Go crypto/tls — entry probes only (attached via symbol loop).
+		// Return probes use ret-instruction offsets via GoTlsOffsets below.
+		"go_tls_write": ao.objs.KaUprobeGoTlsWrite,
+		"go_tls_read":  ao.objs.KaUprobeGoTlsRead,
 	}
 
 	// Track attached binaries to avoid re-probing.
@@ -699,6 +1086,12 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 				}
 			}
 
+			// Attach Go TLS ret-probes at disassembled ret instruction offsets.
+			// This replaces uretprobes which crash Go programs.
+			if target.GoTlsOffsets != nil {
+				probeCount += ao.attachGoTlsRetProbes(ex, target)
+			}
+
 			if probeCount > 0 {
 				attached[target.BinaryPath] = true
 				ao.Logger.Printf("Attached %d Go HTTP/2 uprobes on %s",
@@ -712,6 +1105,7 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 
 	go ao.drainGoHeaderEvents()
 	go ao.drainGoH2TransportEvents()
+	go ao.drainGoH2SingleHeaderEvents()
 
 	// Periodic rescan for new Go binaries (every 30 seconds).
 	ticker := time.NewTicker(30 * time.Second)
@@ -751,6 +1145,117 @@ func (ao *APIObserver) attachGRPCCUprobes() {
 		case <-ticker.C:
 			ao.scanAndAttachGRPCC(attached)
 		}
+	}
+}
+
+// attachGoTlsRetProbes attaches uprobe-at-ret probes for Go crypto/tls.
+// For each ret instruction offset found by go_tls_offsets.go, a regular
+// uprobe is placed using the _ex BPF programs. This avoids the uretprobe
+// crash that occurs when Go relocates a goroutine's stack.
+func (ao *APIObserver) attachGoTlsRetProbes(ex *link.Executable, target goprobe.GoUProbeTarget) int {
+	offsets := target.GoTlsOffsets
+	if offsets == nil {
+		return 0
+	}
+
+	probeCount := 0
+
+	// Attach write return probes.
+	if offsets.GoWriteOffset != nil {
+		for _, exitOff := range offsets.GoWriteOffset.Exits {
+			l, err := attachUprobeWithFallback(ex, "", ao.objs.KaUprobeGoTlsWriteEx, exitOff)
+			if err != nil {
+				ao.Logger.Debugf("Go TLS write_ex at 0x%x on %s: %v", exitOff, target.BinaryPath, err)
+				continue
+			}
+			ao.links = append(ao.links, l)
+			probeCount++
+		}
+		ao.Logger.Printf("  Go TLS write_ex: %d ret probes attached", probeCount)
+	}
+
+	// Attach read return probes.
+	readCount := 0
+	if offsets.GoReadOffset != nil {
+		for _, exitOff := range offsets.GoReadOffset.Exits {
+			l, err := attachUprobeWithFallback(ex, "", ao.objs.KaUprobeGoTlsReadEx, exitOff)
+			if err != nil {
+				ao.Logger.Debugf("Go TLS read_ex at 0x%x on %s: %v", exitOff, target.BinaryPath, err)
+				continue
+			}
+			ao.links = append(ao.links, l)
+			readCount++
+		}
+		ao.Logger.Printf("  Go TLS read_ex: %d ret probes attached", readCount)
+	}
+
+	return probeCount + readCount
+}
+
+// drainKsTlsChunks reads the kubeshark-style TLS chunk perf buffer.
+// Each chunk contains decrypted plaintext data + source/dest addresses.
+// Chunks are parsed into DataEvents and fed into the correlator pipeline.
+func (ao *APIObserver) drainKsTlsChunks() {
+	ao.wg.Add(1)
+	defer ao.wg.Done()
+
+	if ao.ksTlsChunksReader == nil {
+		return
+	}
+
+	ao.Logger.Print("Starting kubeshark TLS chunk perf reader")
+
+	chunkCount := uint64(0)
+	for {
+		record, err := ao.ksTlsChunksReader.Read()
+		if err != nil {
+			if errors.Is(err, perf.ErrClosed) {
+				ao.Logger.Print("KS TLS perf reader closed")
+				return
+			}
+			continue
+		}
+		if record.LostSamples != 0 {
+			ao.Logger.Warnf("KS TLS perf: lost %d samples", record.LostSamples)
+			continue
+		}
+
+		raw := record.RawSample
+		chunkCount++
+
+		// Parse the TLS chunk into a structured event.
+		chunk, err := events.ParseTlsChunkEvent(raw)
+		if err != nil {
+			ao.Logger.Debugf("ParseTlsChunkEvent error: %v", err)
+			continue
+		}
+
+		// Diagnostic: log every chunk received from BPF.
+		dataPreview := ""
+		if len(chunk.Data) > 0 {
+			previewLen := len(chunk.Data)
+			if previewLen > 80 {
+				previewLen = 80
+			}
+			dataPreview = string(chunk.Data[:previewLen])
+		}
+		ao.Logger.Debugf("KS TLS chunk #%d: pid=%d fd=%d flags=0x%x len=%d start=%d recorded=%d family=%d src=%s:%d dst=%s:%d data=%q",
+			chunkCount, chunk.PID, chunk.FD, chunk.Flags, chunk.Len, chunk.Start, chunk.Recorded,
+			chunk.Family, chunk.SrcIPString(), chunk.SrcPort, chunk.DstIPString(), chunk.DstPort,
+			dataPreview)
+
+		// Skip empty chunks (start > 0 means continuation — for now,
+		// we only process the first chunk of each TLS operation).
+		if chunk.Start > 0 || chunk.Recorded == 0 {
+			continue
+		}
+
+		// Convert to DataEvent and feed into the correlator pipeline.
+		ev := chunk.ToDataEvent()
+		ao.Logger.Debugf("KS TLS → DataEvent: pid=%d fd=%d src=%s:%d dst=%s:%d dir=%d flags=0x%x payloadLen=%d",
+			ev.PID, ev.FD, ev.SrcIPString(), ev.SrcPort, ev.DstIPString(), ev.DstPort,
+			ev.Direction, ev.Flags, len(ev.Payload))
+		ao.processEvent(*ev)
 	}
 }
 
@@ -844,6 +1349,65 @@ func (ao *APIObserver) drainGoH2TransportEvents() {
 	}
 }
 
+// drainGoH2SingleHeaderEvents reads per-field header events emitted by
+// hpack.WriteField and loopyWriter.writeHeader probes, and accumulates
+// them into the correlator's transport header staging map.
+func (ao *APIObserver) drainGoH2SingleHeaderEvents() {
+	ao.wg.Add(1)
+	defer ao.wg.Done()
+
+	if ao.goH2SingleHeaderEvents == nil {
+		return
+	}
+
+	ao.Logger.Print("Starting Go HTTP/2 single-header events reader")
+
+	go func() {
+		for {
+			record, err := ao.goH2SingleHeaderEvents.Read()
+			if err != nil {
+				if errors.Is(err, ringbuf.ErrClosed) {
+					return
+				}
+				ao.Logger.Warnf("Go H2 single-header ringbuf read error: %v", err)
+				continue
+			}
+			select {
+			case ao.goH2SingleHeaderChannel <- record.RawSample:
+			case <-ao.ctx.Done():
+				return
+			default:
+				slog.Debug("Dropping Go H2 single-header event due to load")
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-ao.ctx.Done():
+			return
+		case raw := <-ao.goH2SingleHeaderChannel:
+			ev, err := events.ParseGoH2SingleHeaderEvent(raw)
+			if err != nil {
+				ao.Logger.Debugf("ParseGoH2SingleHeaderEvent error: %v", err)
+				continue
+			}
+			name := ev.HeaderName()
+			value := ev.HeaderValue()
+			if name == "" {
+				continue
+			}
+			slog.Debug("Go H2 single-header event",
+				"pid", ev.PID,
+				"stream_id", ev.StreamID,
+				"name", name,
+				"value", value,
+			)
+			ao.correlator.InjectGoH2SingleHeader(ev.PID, ev.StreamID, name, value)
+		}
+	}
+}
+
 // scanAndAttachGRPCC is the inner scan body, called from attachGRPCCUprobes.
 func (ao *APIObserver) scanAndAttachGRPCC(attached map[string]bool) {
 	targets, err := grpcc.ScanProc()
@@ -920,6 +1484,38 @@ func (ao *APIObserver) populateGoBPFMaps(target goprobe.GoUProbeTarget) {
 	}
 }
 
+// Protocol config map key indices — must match PROTO_CONFIG_* in macros.h.
+const (
+	protoConfigHTTP1 uint32 = 0
+	protoConfigHTTP2 uint32 = 1
+	protoConfigGRPC  uint32 = 2
+)
+
+// protocolConfig matches BPF struct protocol_config.
+type protocolConfig struct {
+	MaxCaptureSize uint32
+}
+
+// populateProtocolConfig writes per-protocol capture size limits into the
+// BPF protocol_config_map. Called once at startup.
+func (ao *APIObserver) populateProtocolConfig() {
+	configs := []struct {
+		key uint32
+		cfg protocolConfig
+	}{
+		{protoConfigHTTP1, protocolConfig{MaxCaptureSize: 8192}}, // full payload for HTTP/1
+		{protoConfigHTTP2, protocolConfig{MaxCaptureSize: 4096}}, // smaller for HTTP/2 frames
+		{protoConfigGRPC, protocolConfig{MaxCaptureSize: 4096}},  // smaller for gRPC frames
+	}
+
+	for _, c := range configs {
+		if err := ao.objs.ProtocolConfigMap.Put(c.key, c.cfg); err != nil {
+			ao.Logger.Warnf("Failed to set protocol_config_map[%d]: %v", c.key, err)
+		}
+	}
+	ao.Logger.Print("Protocol-aware capture config populated")
+}
+
 // Lifecycle
 func (ao *APIObserver) DestroyAPIObserver() error {
 	if ao == nil {
@@ -947,16 +1543,26 @@ func (ao *APIObserver) DestroyAPIObserver() error {
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
+	if ao.goH2SingleHeaderEvents != nil {
+		if err := ao.goH2SingleHeaderEvents.Close(); err != nil {
+			ao.Logger.Err(err.Error())
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
+	}
 	if ao.grpccEvents != nil {
 		if err := ao.grpccEvents.Close(); err != nil {
 			ao.Logger.Err(err.Error())
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
 	}
-	if err := ao.objs.Close(); err != nil {
-		ao.Logger.Err(err.Error())
-		cleanupErr = errors.Join(cleanupErr, err)
+	if ao.ksTlsChunksReader != nil {
+		if err := ao.ksTlsChunksReader.Close(); err != nil {
+			ao.Logger.Err(err.Error())
+			cleanupErr = errors.Join(cleanupErr, err)
+		}
 	}
+	// Close probe links BEFORE closing BPF objects — programs must outlive
+	// the links that reference them.
 	for _, l := range ao.links {
 		if l == nil {
 			continue
@@ -965,6 +1571,10 @@ func (ao *APIObserver) DestroyAPIObserver() error {
 			ao.Logger.Err(err.Error())
 			cleanupErr = errors.Join(cleanupErr, err)
 		}
+	}
+	if err := ao.objs.Close(); err != nil {
+		ao.Logger.Err(err.Error())
+		cleanupErr = errors.Join(cleanupErr, err)
 	}
 	if ao.correlator != nil {
 		ao.correlator.Stop()
