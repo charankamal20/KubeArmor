@@ -13,6 +13,7 @@
 package filter
 
 import (
+	"fmt"
 	"strings"
 	"time"
 )
@@ -32,14 +33,21 @@ func NewFilterer() *Filterer {
 // window. The key is constructed from sorted IPs (so client/server
 // observations hash identically), method, path, and status.
 func (f *Filterer) IsDuplicate(srcIP, dstIP string, srcPort, dstPort int32, method, path, status string) bool {
-	// Sort IPs so both perspectives produce the same key.
-	var lo, hi string
-	if srcIP < dstIP {
-		lo, hi = srcIP, dstIP
+	// The client's ephemeral port (higher number) uniquely identifies the
+	// TCP connection.  It's constant regardless of whether we see the pod IP
+	// or the service VIP as the server — only the server-side IP changes.
+	// By keying on (clientIP, ephemeralPort, method, path, status) we dedup
+	// pod-vs-service duplicates without losing any unique requests.
+	var clientIP string
+	var clientPort int32
+	if srcPort > dstPort {
+		clientIP = srcIP
+		clientPort = srcPort
 	} else {
-		lo, hi = dstIP, srcIP
+		clientIP = dstIP
+		clientPort = dstPort
 	}
-	key := lo + hi + method + path + status
+	key := clientIP + ":" + fmt.Sprint(clientPort) + "|" + method + "|" + path + "|" + status
 	return f.dedup.IsDuplicate(key)
 }
 

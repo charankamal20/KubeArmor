@@ -86,6 +86,11 @@ var DefaultMatchers = []SSLLibMatcher{
 	// Node.js (statically links OpenSSL into the node binary)
 	{LibSSL: "node", LibCrypto: "",
 		SearchType: MatchExecutable, SocketFDAccess: SSLFDNestedSyscall},
+	// Envoy proxy (Istio sidecar, ingress gateways) — statically links BoringSSL.
+	// BoringSSL exports the same SSL_read/SSL_write symbols as OpenSSL.
+	// Reference: kubeshark tracer/pkg/discoverer/pids.go:installEnvoysslHook
+	{LibSSL: "envoy", LibCrypto: "",
+		SearchType: MatchExecutable, SocketFDAccess: SSLFDNestedSyscall},
 	// Java/Netty tcnative (BoringSSL)
 	{LibSSL: "libnetty_tcnative_linux", LibCrypto: "",
 		SearchType: MatchContains, SocketFDAccess: SSLFDUserSpaceOffsets},

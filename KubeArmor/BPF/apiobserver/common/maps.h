@@ -245,3 +245,13 @@ struct {
   __type(key, int);
   __type(value, __u32);
 } ks_chunks_buffer SEC(".maps");
+
+/* Port exclusion map: port (u16) → excluded (u8).
+ * Populated by userspace at startup. Lookup returns non-NULL if port should
+ * be excluded from tracing. Replaces hardcoded switch in filter_helpers.h. */
+struct {
+  __uint(type, BPF_MAP_TYPE_HASH);
+  __uint(max_entries, 64);
+  __type(key, __u16);
+  __type(value, __u8);
+} port_exclusion_map SEC(".maps");

@@ -175,6 +175,12 @@ func (ct *ConnectionTracker) Route(ev *events.DataEvent, cor CorrelatorIface) []
 		}
 	}
 
+	// Propagate detected protocol back to the DataEvent so downstream
+	// consumers (enrichAndEmit) see the correct protocol string.
+	if ev.Protocol == events.ProtoUnknown {
+		ev.Protocol = ct.Protocol
+	}
+
 	return ct.iterMessages(ev, cor)
 }
 
@@ -277,16 +283,38 @@ func (ct *ConnectionTracker) iterMessages(ev *events.DataEvent, cor CorrelatorIf
 func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface) []*events.CorrelatedTrace {
 	var out []*events.CorrelatedTrace
 
-	if ev.Direction == events.DirEgress {
-		data := ct.sendBuf.Bytes()
+	// Determine if this event carries request or response data.
+	// Client-side: egress = request, ingress = response.
+	// Server-side: ingress = request, egress = response.
+	var isRequest bool
+	if ct.isClientSide {
+		isRequest = (ev.Direction == events.DirEgress)
+	} else {
+		isRequest = (ev.Direction == events.DirIngress)
+	}
+
+	// Select the correct buffers based on perspective.
+	// Client: sendBuf = requests, recvBuf = responses.
+	// Server: recvBuf = requests, sendBuf = responses.
+	var reqBuf, respBuf *DataStreamBuffer
+	if ct.isClientSide {
+		reqBuf = ct.sendBuf
+		respBuf = ct.recvBuf
+	} else {
+		reqBuf = ct.recvBuf
+		respBuf = ct.sendBuf
+	}
+
+	if isRequest {
+		data := reqBuf.Bytes()
 		if len(data) == 0 {
 			return nil
 		}
 
 		if bytes.HasPrefix(data, []byte("HTTP/")) {
-			slog.Debug("Response data on egress stream, discarding",
+			slog.Debug("Response data in request buffer, discarding",
 				"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
-			ct.sendBuf.Reset()
+			reqBuf.Reset()
 			return nil
 		}
 
@@ -295,22 +323,23 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		if consumed > 0 {
 			ct.parseErrCount = 0
-			ct.sendBuf.Advance(consumed)
+			reqBuf.Advance(consumed)
 		}
 		// drain remaining request body bytes off the wire
 		if skipBytes > 0 {
-			ct.sendBuf.SkipNextBytes(skipBytes)
+			reqBuf.SkipNextBytes(skipBytes)
 		}
 
 		for _, req := range reqs {
 			cor.AddHTTP1Request(ct.Key, events.PendingRequest{
-				Timestamp: time.Now(),
-				Method:    req.Method,
-				URL:       req.Path,
-				Headers:   req.Headers,
-				Body:      string(req.Body),
-				Src:       fmt.Sprintf("%s:%d", ev.SrcIPString(), ev.SrcPort),
-				Dst:       fmt.Sprintf("%s:%d", ev.DstIPString(), ev.DstPort),
+				Timestamp:   time.Now(),
+				Method:      req.Method,
+				URL:         req.Path,
+				Headers:     req.Headers,
+				Body:        string(req.Body),
+				Src:         fmt.Sprintf("%s:%d", ev.SrcIPString(), ev.SrcPort),
+				Dst:         fmt.Sprintf("%s:%d", ev.DstIPString(), ev.DstPort),
+				IsEncrypted: ev.IsSSL(),
 			})
 		}
 
@@ -327,21 +356,21 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 			if ct.parseErrCount >= maxConsecutiveParseErrors {
 				log.Warnf("HTTP/1: too many consecutive parse errors, resetting buffer, sockptr: %s, protocol: %d",
 					fmt.Sprintf("0x%x", ct.Key.SockPtr), ct.Protocol)
-				ct.sendBuf.Reset()
+				reqBuf.Reset()
 				ct.parseErrCount = 0
 			}
 			return nil
 		}
 	} else {
-		data := ct.recvBuf.Bytes()
+		data := respBuf.Bytes()
 		if len(data) == 0 {
 			return nil
 		}
 
 		if isHTTP1RequestPrefix(data) {
-			slog.Debug("Request data on ingress stream, discarding",
+			slog.Debug("Request data in response buffer, discarding",
 				"sockptr", fmt.Sprintf("0x%x", ct.Key.SockPtr))
-			ct.recvBuf.Reset()
+			respBuf.Reset()
 			return nil
 		}
 
@@ -350,11 +379,11 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 		if consumed > 0 {
 			ct.parseErrCount = 0
-			ct.recvBuf.Advance(consumed)
+			respBuf.Advance(consumed)
 		}
 		// drain remaining response body bytes off the wire
 		if skipBytes > 0 {
-			ct.recvBuf.SkipNextBytes(skipBytes)
+			respBuf.SkipNextBytes(skipBytes)
 		}
 
 		serverURI := fmt.Sprintf("%s:%d", ev.SrcIPString(), ev.SrcPort)
@@ -385,7 +414,7 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 			if ct.parseErrCount >= maxConsecutiveParseErrors {
 				log.Warnf("HTTP/1: too many consecutive parse errors, resetting buffer, sockptr: %s, protocol: %d",
 					fmt.Sprintf("0x%x", ct.Key.SockPtr), ct.Protocol)
-				ct.recvBuf.Reset()
+				respBuf.Reset()
 				ct.parseErrCount = 0
 			}
 			return out
@@ -394,6 +423,7 @@ func (ct *ConnectionTracker) iterHTTP1(ev *events.DataEvent, cor CorrelatorIface
 
 	return out
 }
+
 
 // isHTTP1RequestPrefix returns true if buf starts with a known HTTP/1.x
 // request method token (full token including trailing space).
@@ -502,6 +532,7 @@ func (ct *ConnectionTracker) iterHTTP2(ev *events.DataEvent, cor CorrelatorIface
 				Src:         fmt.Sprintf("%s:%d", ev.SrcIPString(), ev.SrcPort),
 				Dst:         fmt.Sprintf("%s:%d", ev.DstIPString(), ev.DstPort),
 				StreamID:    msg.StreamID,
+				IsEncrypted: ev.IsSSL(),
 				GRPCService: grpcService,
 				GRPCMethod:  grpcMethod,
 				ContentType: contentType,

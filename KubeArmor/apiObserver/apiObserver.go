@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -35,11 +36,17 @@ import (
 
 //go:generate go run github.com/cilium/ebpf/cmd/bpf2go -target amd64,arm64 -cc clang apiObserver ../BPF/api_observer.bpf.c
 
+// ServiceResolver maps a ClusterIP to a K8s service FQDN (e.g.
+// "cartservice.online-boutique.svc.cluster.local"). Returns empty
+// string when no match found. Injected by the core daemon.
+type ServiceResolver func(ip string) string
+
 // APIObserver captures and processes network events via eBPF.
 type APIObserver struct {
 	Logger fd.Feeder
 
-	nodeName string
+	nodeName         string
+	resolveServiceFn ServiceResolver
 
 	// BPF compiled objects and attached probe links.
 	objs  apiObserverObjects
@@ -79,10 +86,14 @@ type APIObserver struct {
 	wg     sync.WaitGroup
 }
 
-func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserver, error) {
+func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder, svcResolver ServiceResolver) (*APIObserver, error) {
+	if svcResolver == nil {
+		svcResolver = func(ip string) string { return "" }
+	}
 	ao := &APIObserver{
-		Logger:   logger,
-		nodeName: node.NodeName,
+		Logger:           logger,
+		nodeName:         node.NodeName,
+		resolveServiceFn: svcResolver,
 	}
 	ao.ctx, ao.cancel = context.WithCancel(context.Background())
 
@@ -106,6 +117,7 @@ func NewAPIObserver(node tp.Node, pinpath string, logger fd.Feeder) (*APIObserve
 
 	// Populate protocol-aware capture size limits.
 	ao.populateProtocolConfig()
+	ao.populatePortExclusions()
 
 	if err = ao.attachTracepoint(); err != nil {
 		ao.Logger.Warnf("Failed to attach tracepoint (connection tracking degraded): %v", err)
@@ -548,14 +560,9 @@ func (ao *APIObserver) enrichAndEmit(trace *events.CorrelatedTrace, ev *events.D
 	// Build pb.APIEvent.
 	latencyMs := uint32(trace.DurationNs / 1_000_000)
 
-	// Resolve :authority for pseudo-headers.
-	authority := trace.RequestHeaders["host"]
-	if authority == "" {
-		authority = trace.RequestHeaders[":authority"]
-	}
-	if authority == "" {
-		authority = dstName
-	}
+	// Resolve :authority — prefer host header, then :authority, then
+	// resolve destination IP to K8s service name, fallback to ip:port.
+	authority := ao.resolveAuthority(trace, ev)
 
 	// Ensure method and path are always populated.
 	method := sanitizeUTF8(trace.Method)
@@ -599,7 +606,7 @@ func (ao *APIObserver) enrichAndEmit(trace *events.CorrelatedTrace, ev *events.D
 
 	apiEvent := pb.APIEvent{
 		Metadata: &pb.Metadata{
-			Timestamp:    uint64(time.Now().UnixNano()),
+			Timestamp:    uint64(time.Now().Unix()),
 			NodeName:     ao.nodeName,
 			ReceiverName: "KubeArmor",
 		},
@@ -713,7 +720,33 @@ func (ao *APIObserver) flushLoop() {
 // K8s metadata resolution
 
 func (ao *APIObserver) resolveWorkload(ip string) (name, namespace string) {
-	return ip, ""
+	return "", ""
+}
+
+// resolveAuthority determines the :authority pseudo-header value.
+// Priority: host header > :authority header > K8s service name > ip:port.
+func (ao *APIObserver) resolveAuthority(trace *events.CorrelatedTrace, ev *events.DataEvent) string {
+	// 1. Use explicitly set host header (client-provided FQDN).
+	if h := trace.RequestHeaders["host"]; h != "" {
+		return h
+	}
+	// 2. Use :authority if already a hostname (not an IP).
+	if auth := trace.RequestHeaders[":authority"]; auth != "" {
+		authHost := auth
+		if idx := strings.LastIndex(authHost, ":"); idx > 0 {
+			authHost = authHost[:idx]
+		}
+		if net.ParseIP(authHost) == nil {
+			// Already a hostname, use as-is.
+			return auth
+		}
+	}
+	// 3. Resolve destination IP to K8s service name.
+	if svcName := ao.resolveServiceFn(ev.DstIPString()); svcName != "" {
+		return svcName
+	}
+	// 4. Fallback: ip:port.
+	return fmt.Sprintf("%s:%d", ev.DstIPString(), ev.DstPort)
 }
 
 // sslProbeKey tracks probed SSL libraries by (path, inode) to avoid re-probing.
@@ -1007,19 +1040,19 @@ func (ao *APIObserver) attachGoHTTP2Uprobes() {
 	// For uretprobes (non-Go functions only), the key gets a "_ret" suffix.
 	// Go TLS ret probes use a separate path — see GoTlsOffsets below.
 	probeMap := map[string]*ebpf.Program{
-		"server_handleStream":      ao.objs.KaUprobeServerHandleStream,
-		"server_handleStream_ret":  ao.objs.KaUretprobeServerHandleStream,
-		"transport_writeStatus":    ao.objs.KaUprobeTransportWriteStatus,
-		"ClientConn_Invoke":        ao.objs.KaUprobeClientConnInvoke,
-		"ClientConn_Invoke_ret":    ao.objs.KaUretprobeClientConnInvoke,
-		"ClientConn_NewStream":     ao.objs.KaUprobeClientConnNewStream,
-		"clientStream_RecvMsg_ret": ao.objs.KaUretprobeClientStreamRecvMsg,
-		"operate_headers_server":   ao.objs.KaUprobeOperateHeadersServer,
-		"operate_headers_client":   ao.objs.KaUprobeOperateHeadersClient,
-		"net_http_processHeaders":  ao.objs.KaUprobeNetHttpProcessHeaders,
+		"server_handleStream":       ao.objs.KaUprobeServerHandleStream,
+		"server_handleStream_ret":   ao.objs.KaUretprobeServerHandleStream,
+		"transport_writeStatus":     ao.objs.KaUprobeTransportWriteStatus,
+		"ClientConn_Invoke":         ao.objs.KaUprobeClientConnInvoke,
+		"ClientConn_Invoke_ret":     ao.objs.KaUretprobeClientConnInvoke,
+		"ClientConn_NewStream":      ao.objs.KaUprobeClientConnNewStream,
+		"clientStream_RecvMsg_ret":  ao.objs.KaUretprobeClientStreamRecvMsg,
+		"operate_headers_server":    ao.objs.KaUprobeOperateHeadersServer,
+		"operate_headers_client":    ao.objs.KaUprobeOperateHeadersClient,
+		"net_http_processHeaders":   ao.objs.KaUprobeNetHttpProcessHeaders,
 		"loopy_writer_write_header": ao.objs.KaUprobeLoopyWriterWriteHeader,
-		"hpack_write_field":        ao.objs.KaUprobeHpackWriteField,
-		"http2_write_res_headers":  ao.objs.KaUprobeHttp2WriteResHeaders,
+		"hpack_write_field":         ao.objs.KaUprobeHpackWriteField,
+		"http2_write_res_headers":   ao.objs.KaUprobeHttp2WriteResHeaders,
 		// Go crypto/tls — entry probes only (attached via symbol loop).
 		// Return probes use ret-instruction offsets via GoTlsOffsets below.
 		"go_tls_write": ao.objs.KaUprobeGoTlsWrite,
@@ -1514,6 +1547,35 @@ func (ao *APIObserver) populateProtocolConfig() {
 		}
 	}
 	ao.Logger.Print("Protocol-aware capture config populated")
+}
+
+// defaultExcludedPorts lists Kubernetes control-plane and infrastructure ports
+// that should not be traced. Populated into BPF port_exclusion_map at startup.
+var defaultExcludedPorts = []uint16{
+	6443,  // kube-apiserver
+	2379,  // etcd client
+	2380,  // etcd peer
+	10250, // kubelet API
+	10255, // kubelet read-only
+	10256, // kube-proxy health
+	9091,  // prometheus pushgateway
+	9099,  // calico felix
+	9100,  // node-exporter
+}
+
+// populatePortExclusions writes default + user-configured excluded ports into
+// BPF port_exclusion_map. Called once at startup.
+func (ao *APIObserver) populatePortExclusions() {
+	excluded := uint8(1)
+	count := 0
+	for _, port := range defaultExcludedPorts {
+		if err := ao.objs.PortExclusionMap.Put(port, excluded); err != nil {
+			ao.Logger.Warnf("Failed to set port_exclusion_map[%d]: %v", port, err)
+		} else {
+			count++
+		}
+	}
+	ao.Logger.Printf("Port exclusion map populated: %d ports excluded", count)
 }
 
 // Lifecycle
