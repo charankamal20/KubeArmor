@@ -829,8 +829,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
-	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -1098,14 +1096,7 @@ func (s *FilterService) readerWorker(id int) {
 func (s *FilterService) route(evt rawEvent) {
 
 	switch evt.eType.Type {
-	case EventTypeFileCreate,
-		EventTypeFileRead,
-		EventTypeFileWrite,
-		EventTypeFileSetInfo,
-		EventTypeFileRename,
-		EventTypeFileDelete,
-		EventTypeFileCLOSE:
-
+	case 2: // File
 		select {
 		case s.fileEventChan <- evt:
 			s.fileReceived.Add(1)
@@ -1114,9 +1105,7 @@ func (s *FilterService) route(evt rawEvent) {
 			s.Logger.Warnf("file event channel full — dropped event type %d", evt.eType.Type)
 		}
 
-	case EventTypeProcessCreate,
-		EventTypeProcessTerminate:
-
+	case 1: // Process
 		select {
 		case s.processEventChan <- evt:
 			s.procReceived.Add(1)
@@ -1162,9 +1151,7 @@ func (s *FilterService) fileProcessorWorker(id int) {
 				return
 			}
 			log_ := &tp.Log{}
-			handleFileEvent(bytes.NewBuffer(evt.buf), log_)
-			log_.Data += " Event=" + getFileEvent(evt.eType.Type)
-			log_.Data = strings.TrimSpace(log_.Data)
+			handleFileEvent(evt.buf, log_)
 			if err := s.processMessage(log_); err == nil {
 				s.fileProcessed.Add(1)
 			}
@@ -1190,9 +1177,7 @@ func (s *FilterService) processProcessorWorker(id int) {
 				return
 			}
 			log_ := &tp.Log{}
-			handleProcessEvent(bytes.NewBuffer(evt.buf), log_)
-			log_.Data += " Event=" + getProcessEvent(evt.eType.Type)
-			log_.Data = strings.TrimSpace(log_.Data)
+			handleProcessEvent(evt.buf, log_)
 			if err := s.processMessage(log_); err == nil {
 				s.procProcessed.Add(1)
 			}
@@ -1276,17 +1261,14 @@ func stripFilterHeader(buf []byte) (msgID uint64, payload []byte, err error) {
 // and returns it together with the remaining bytes (so callers do not need to
 // re-create a buffer).
 func parseLeadingEventType(payload []byte) (eType *EventType, remaining []byte, err error) {
-	buf := bytes.NewBuffer(payload)
-	eType, err = parseEventType(buf)
-	if err != nil {
-		return nil, nil, err
+	if len(payload) < 16 {
+		return nil, nil, fmt.Errorf("payload too short")
 	}
-	if eType.FieldID != FieldEventType {
-		return nil, nil, fmt.Errorf("first field is not FieldEventType (got %d)", eType.FieldID)
+	op := binary.LittleEndian.Uint32(payload[12:16])
+	eType = &EventType{
+		Type: op,
 	}
-	// buf.Bytes() is the unconsumed tail after parseEventType.
-	remaining = buf.Bytes()
-	return
+	return eType, payload, nil
 }
 
 func getOperationType(op uint32) string {
@@ -1337,6 +1319,12 @@ func getFileOperation(op uint32) string {
 		return "Write"
 	case 3:
 		return "Delete"
+	case 4:
+		return "Rename"
+	case 5:
+		return "SetInfo"
+	case 7:
+		return "Close"
 	default:
 		return "INVALID_FILE_OPERATION"
 	}
@@ -1370,109 +1358,93 @@ func getElevationType(et uint32) string {
 	}
 }
 
-func handleFileEvent(buf *bytes.Buffer, log_ *tp.Log) {
+func handleFileEvent(buf []byte, log_ *tp.Log) {
+	if len(buf) < 41 {
+		return
+	}
 	log_.Type = "HostLog"
 	log_.Operation = "File"
+	log_.Timestamp = int64(binary.LittleEndian.Uint64(buf[0:8]))
 
-	fileEventFields := []uint8{
-		FieldTimestamp,
-		FieldProcessID,
-		FieldImagePath,
-		FieldFilePath,
-		FieldVolumeGUID,
-		FieldVolumeType,
-		FieldVolumeName,
+	fileOp := binary.LittleEndian.Uint32(buf[17:21])
+	log_.PID = int32(binary.LittleEndian.Uint32(buf[21:25]))
+
+	pPathOff := binary.LittleEndian.Uint32(buf[25:29])
+	pPathLen := binary.LittleEndian.Uint32(buf[29:33])
+	fPathOff := binary.LittleEndian.Uint32(buf[33:37])
+	fPathLen := binary.LittleEndian.Uint32(buf[37:41])
+
+	if pPathOff > 0 && pPathLen > 0 && int(pPathOff+pPathLen) <= len(buf) {
+		pPathBytes := buf[pPathOff : pPathOff+pPathLen]
+		u16Str := make([]uint16, pPathLen/2)
+		for i := range u16Str {
+			u16Str[i] = binary.LittleEndian.Uint16(pPathBytes[i*2:])
+		}
+		log_.ProcessName = windows.UTF16ToString(u16Str)
 	}
 
-	for i, _ := range fileEventFields {
-		f, err := parseField(buf)
-		if err != nil || f == nil {
-			if err != nil {
-				fmt.Printf("failed to parse file event after %d fields: %v, remaining bytes: %d\n",
-					i+1, err, buf.Len())
-			} else {
-				fmt.Println("reached end of the event")
-			}
-			return
+	if fPathOff > 0 && fPathLen > 0 && int(fPathOff+fPathLen) <= len(buf) {
+		fPathBytes := buf[fPathOff : fPathOff+fPathLen]
+		u16Str := make([]uint16, fPathLen/2)
+		for i := range u16Str {
+			u16Str[i] = binary.LittleEndian.Uint16(fPathBytes[i*2:])
 		}
-		switch f.FieldID {
-		case FieldTimestamp:
-			log_.Timestamp = int64(f.ULongLong())
-		case FieldProcessID:
-			fmt.Println("parsing FieldProcessID")
-			log_.PID = int32(f.ULong())
-		case FieldImagePath:
-			log_.ProcessName = f.UnicodeString()
-		case FieldFilePath:
-			log_.Resource = f.UnicodeString()
-		case FieldVolumeType:
-			fmt.Println("parsing FieldVolumeType")
-			log_.Data += "volumeType=" + getVolumeType(f.ULong()) + " "
-		case FieldVolumeName:
-			log_.Data += "volumeName=" + f.UnicodeString() + " "
-		}
+		log_.Resource = windows.UTF16ToString(u16Str)
 	}
+
+	log_.Data = "Event=" + getFileOperation(fileOp)
 }
 
-func handleProcessEvent(buf *bytes.Buffer, log_ *tp.Log) {
+func handleProcessEvent(buf []byte, log_ *tp.Log) {
+	if len(buf) < 53 {
+		return
+	}
 	log_.Type = "HostLog"
 	log_.Operation = "Process"
+	log_.Timestamp = int64(binary.LittleEndian.Uint64(buf[0:8]))
 
-	processEventFields := []uint8{
-		FieldTimestamp,
-		FieldProcessID,
-		FieldParentProcessID,
-		FieldParentProcessImagePath,
-		FieldCreatorProcessID,
-		FieldCreatorProcessImagePath,
-		FieldImagePath,
-		FieldCommandLine,
-		FieldExitCode,
-		FieldProcessUserSID,
-		FieldProcessTokenElevation,
-		FieldProcessTokenElevationType,
+	procOp := binary.LittleEndian.Uint32(buf[17:21])
+	log_.PID = int32(binary.LittleEndian.Uint32(buf[21:25]))
+	log_.PPID = int32(binary.LittleEndian.Uint32(buf[25:29]))
+
+	pPathOff := binary.LittleEndian.Uint32(buf[29:33])
+	pPathLen := binary.LittleEndian.Uint32(buf[33:37])
+	cmdOff := binary.LittleEndian.Uint32(buf[37:41])
+	cmdLen := binary.LittleEndian.Uint32(buf[41:45])
+	ppPathOff := binary.LittleEndian.Uint32(buf[45:49])
+	ppPathLen := binary.LittleEndian.Uint32(buf[49:53])
+
+	if pPathOff > 0 && pPathLen > 0 && int(pPathOff+pPathLen) <= len(buf) {
+		pPathBytes := buf[pPathOff : pPathOff+pPathLen]
+		u16Str := make([]uint16, pPathLen/2)
+		for i := range u16Str {
+			u16Str[i] = binary.LittleEndian.Uint16(pPathBytes[i*2:])
+		}
+		log_.ProcessName = windows.UTF16ToString(u16Str)
 	}
 
-	for i, _ := range processEventFields {
-		f, err := parseField(buf)
-		if err != nil || f == nil {
-			if err != nil {
-				fmt.Printf("failed to parse process event after %d fields: %v, remaining bytes: %d\n",
-					i+1, err, buf.Len())
-			} else {
-				fmt.Println("reached end of the event")
-			}
-			return
+	if cmdOff > 0 && cmdLen > 0 && int(cmdOff+cmdLen) <= len(buf) {
+		cmdBytes := buf[cmdOff : cmdOff+cmdLen]
+		u16Str := make([]uint16, cmdLen/2)
+		for i := range u16Str {
+			u16Str[i] = binary.LittleEndian.Uint16(cmdBytes[i*2:])
 		}
-		switch f.FieldID {
-		case FieldTimestamp:
-			log_.Timestamp = int64(f.ULongLong())
-		case FieldProcessID:
-			fmt.Println("parsing FieldProcessID")
-			log_.PID = int32(f.ULong())
-		case FieldParentProcessID:
-			fmt.Println("parsing FieldParentProcessID")
-			log_.PPID = int32(f.ULong())
-		case FieldParentProcessImagePath:
-			log_.ParentProcessName = f.UnicodeString()
-		case FieldCreatorProcessID:
-			fmt.Println("parsing FieldCreatorProcessID")
-			log_.HostPPID = int32(f.ULong())
-		case FieldImagePath:
-			log_.ProcessName = f.UnicodeString()
-		case FieldCommandLine:
-			log_.Source = f.UnicodeString()
-		case FieldExitCode:
-			fmt.Println("parsing FieldExitCode")
-			log_.Result = strconv.Itoa(int(f.ULong()))
-		case FieldProcessUserSID:
-			log_.Data = log_.Data + " UserSid=" + f.UnicodeString()
-		case FieldProcessTokenElevation:
-			log_.Data = log_.Data + " Elevated=" + strconv.FormatBool(f.Boolean())
-		case FieldProcessTokenElevationType:
-			fmt.Println("parsing FieldProcessTokenElevationType")
-			log_.Data = log_.Data + " ElevationType=" + getElevationType(f.ULong())
+		log_.Source = windows.UTF16ToString(u16Str)
+	}
+
+	if ppPathOff > 0 && ppPathLen > 0 && int(ppPathOff+ppPathLen) <= len(buf) {
+		ppPathBytes := buf[ppPathOff : ppPathOff+ppPathLen]
+		u16Str := make([]uint16, ppPathLen/2)
+		for i := range u16Str {
+			u16Str[i] = binary.LittleEndian.Uint16(ppPathBytes[i*2:])
 		}
+		log_.ParentProcessName = windows.UTF16ToString(u16Str)
+	}
+
+	if procOp == 0 {
+		log_.Data = "Event=Create"
+	} else {
+		log_.Data = "Event=Terminate"
 	}
 }
 
