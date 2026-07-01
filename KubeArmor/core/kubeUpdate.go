@@ -2111,6 +2111,7 @@ func (dm *KubeArmorDaemon) UpdateHostSecurityPolicies() {
 // ParseAndUpdateHostSecurityPolicy Function
 func (dm *KubeArmorDaemon) ParseAndUpdateHostSecurityPolicy(event tp.K8sKubeArmorHostPolicyEvent) pb.PolicyStatus {
 	// create a host security policy
+	dm.Logger.Printf("Raw incoming K8sKubeArmorHostPolicyEvent: %+v", event)
 
 	secPolicy := tp.HostSecurityPolicy{}
 
@@ -2121,6 +2122,7 @@ func (dm *KubeArmorDaemon) ParseAndUpdateHostSecurityPolicy(event tp.K8sKubeArmo
 		dm.Logger.Errf("Failed to clone a spec (%s)", err.Error())
 		return pb.PolicyStatus_Failure
 	}
+	dm.Logger.Printf("Cloned HostSecuritySpec: %+v", secPolicy.Spec)
 
 	kl.ObjCommaExpandFirstDupOthers(&secPolicy.Spec.Network.MatchProtocols)
 	kl.ObjCommaExpandFirstDupOthers(&secPolicy.Spec.Capabilities.MatchCapabilities)

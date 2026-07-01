@@ -28,6 +28,7 @@ const (
 )
 
 func init() {
+	fmt.Println("INITIALIZING WINDOWS")
 	buildinfo.PrintBuildDetails()
 }
 

@@ -1194,6 +1194,8 @@ func (s *FilterService) processMessage(msg *tp.Log) error {
 	switch msg.Type {
 	case "HostLog":
 		s.Logger.PushLog(*msg)
+	case "MatchHostPolicy":
+		s.Logger.PushLog(*msg)
 	default:
 		s.Logger.Warnf("unknown log type: %q", msg.Type)
 	}
@@ -1362,9 +1364,18 @@ func handleFileEvent(buf []byte, log_ *tp.Log) {
 	if len(buf) < 41 {
 		return
 	}
-	log_.Type = "HostLog"
 	log_.Operation = "File"
 	log_.Timestamp = int64(binary.LittleEndian.Uint64(buf[0:8]))
+
+	// Read event type from EVENT struct (offset 8, FS_EVENT_TYPE enum)
+	// 1 = EventType_HostLog, 2 = EventType_MatchHostPolicy
+	evType := binary.LittleEndian.Uint32(buf[8:12])
+	log_.Type = getLogType(evType)
+
+	// Read blocked flag from EVENT struct (offset 16, BOOLEAN)
+	blocked := buf[16] != 0
+	log_.Action = getAction(blocked)
+	log_.Result = getResult(!blocked)
 
 	fileOp := binary.LittleEndian.Uint32(buf[17:21])
 	log_.PID = int32(binary.LittleEndian.Uint32(buf[21:25]))
