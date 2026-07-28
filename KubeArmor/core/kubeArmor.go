@@ -295,6 +295,10 @@ func (dm *KubeArmorDaemon) initializeNonK8sEnv() error {
 	dm.Node.Labels["kubearmor.io/hostname"] = dm.Node.NodeName
 
 	dm.Node.Identities = append(dm.Node.Identities, "kubearmor.io/hostname"+"="+dm.Node.NodeName)
+	// Also register the standard kubernetes.io/hostname label so that
+	// KubeArmorHostPolicy nodeSelectors using kubernetes.io/hostname match
+	// in non-K8s (Windows standalone) mode.
+	dm.Node.Identities = append(dm.Node.Identities, "kubernetes.io/hostname"+"="+dm.Node.NodeName)
 
 	dm.Node.Annotations = map[string]string{}
 	dm.HandleNodeAnnotations(&dm.Node)

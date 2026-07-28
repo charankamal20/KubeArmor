@@ -8,6 +8,8 @@
 package enforcer
 
 import (
+	"path/filepath"
+	"strings"
 	"sync"
 
 	fd "github.com/kubearmor/KubeArmor/KubeArmor/feeder"
@@ -33,6 +35,14 @@ type RuntimeEnforcerImpl struct {
 
 	// Mutex for serializing policy updates
 	mu sync.Mutex
+
+	// Cached set of Packaged App executables (.exe basenames).
+	// Built at startup by scanning %ProgramFiles%\WindowsApps.
+	appxSet map[string]struct{}
+
+	// AppLocker event-log poller — emits MatchedHostPolicy alerts for
+	// processes blocked by AppLocker rules.
+	appLockerPoller *AppLockerPoller
 }
 
 // NewRuntimeEnforcer Function
@@ -52,6 +62,18 @@ func NewRuntimeEnforcer(node tp.Node, logger *fd.Feeder, monitor *mon.SystemMoni
 		re.deviceHandle = handle
 		logger.Printf("Karmor driver device opened successfully for enforcement")
 	}
+
+	// Build the set of Packaged App executables for AppLocker policy generation.
+	re.appxSet = buildAppxExeSet()
+	logger.Printf("Built Packaged App set: found %d executables", len(re.appxSet))
+
+	// Start the AppLocker event-log poller. It polls every 5 seconds for new
+	// AppLocker block events (Event IDs 8003/8004/8006) and emits them as
+	// MatchedHostPolicy alerts through the feeder pipeline.
+	// If AppLocker is not present the poller emits nothing (no-op).
+	re.appLockerPoller = NewAppLockerPoller(logger)
+	re.appLockerPoller.Start()
+	logger.Printf("AppLocker event-log poller started")
 
 	logger.UpdateEnforcer(re.EnforcerType)
 	return re
@@ -120,12 +142,20 @@ func (re *RuntimeEnforcerImpl) UpdateHostSecurityPolicies(secPolicies []tp.HostS
 		return
 	}
 
+	// Apply AppLocker policies for process enforcement
+	// We pass the cached appxSet to correctly route rules to the Exe vs Appx collections.
+	if err := applyAppLockerPolicy(secPolicies, re.appxSet); err == nil {
+		re.Logger.Printf("AppLocker policy applied successfully for process enforcement")
+	} else {
+		re.Logger.Printf("AppLocker policy failed or unavailable, falling back to driver process enforcement: %v", err)
+	}
+
 	fileRuleCount := 0
+	dirRuleCount := 0
 	processRuleCount := 0
 
 	// Step 2: Send new rules from each policy
 	for _, policy := range secPolicies {
-		re.Logger.Printf("Processing policy: %+v", policy)
 		defaultAction := mapActionString(policy.Spec.Action)
 
 		// === File matchPaths ===
@@ -156,38 +186,104 @@ func (re *RuntimeEnforcerImpl) UpdateHostSecurityPolicies(secPolicies []tp.HostS
 			fileRuleCount++
 		}
 
-		// === File matchDirectories (Phase 2 — log warning) ===
+		// === File matchDirectories ===
 		for _, dp := range policy.Spec.File.MatchDirectories {
-			re.Logger.Warnf("matchDirectories not yet supported on Windows, skipping: %s", dp.Directory)
+			action := resolveAction(dp.Action, defaultAction)
+			flags := uint16(0)
+			if dp.ReadOnly {
+				flags |= ruleFlagReadOnly
+			}
+			if dp.Recursive {
+				flags |= ruleFlagRecursive
+			}
+
+			ntPath, err := convertToNTPath(dp.Directory)
+			if err != nil {
+				re.Logger.Warnf("Path conversion failed for directory %s: %v (skipping)", dp.Directory, err)
+				continue
+			}
+
+			// Ensure directory path ends with backslash for prefix matching
+			if !strings.HasSuffix(ntPath, "\\") {
+				ntPath += "\\"
+			}
+
+			req, err := buildRuleRequest(ruleTypeFile, matchDirectory, action, flags, ntPath)
+			if err != nil {
+				re.Logger.Errf("Failed to build directory rule request for %s: %v", dp.Directory, err)
+				continue
+			}
+
+			if err := sendIoctl(re.deviceHandle, ioctlAddRule, req); err != nil {
+				re.Logger.Errf("Failed to send directory rule for %s: %v", dp.Directory, err)
+				continue
+			}
+
+			dirRuleCount++
 		}
 
 		// === Process matchPaths ===
 		for _, pp := range policy.Spec.Process.MatchPaths {
 			action := resolveAction(pp.Action, defaultAction)
+			pathStr := string(pp.Path)
+			lowerPath := strings.ToLower(pathStr)
+			ext := filepath.Ext(lowerPath)
 
-			ntPath, err := convertToNTPath(pp.Path)
-			if err != nil {
-				re.Logger.Errf("Path conversion failed for %s: %v", pp.Path, err)
-				continue
+			var rType uint16
+			var mType uint16 = matchPath
+			var targetName string
+
+			switch ext {
+			case ".dll", ".ocx", ".ps1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh":
+				// DLLs and Scripts cannot be blocked by driver Process rules (PsSetCreateProcessNotifyRoutineEx)
+				// because they are interpreted/loaded by a host process (powershell.exe, etc.).
+				// To provide driver fallback if AppLocker is disabled, we translate these into
+				// File rules, which block the host process from reading or executing the file.
+				rType = ruleTypeFile
+				
+				// Driver File rules expect NT paths.
+				ntPath, err := convertToNTPath(pathStr)
+				if err != nil {
+					re.Logger.Warnf("Path conversion failed for script/dll fallback %s: %v", pathStr, err)
+					continue
+				}
+				targetName = ntPath
+			default:
+				// Traditional EXEs (or Appx) are handled by driver Process rules.
+				rType = ruleTypeProcess
+				
+				// For process rules the driver uses suffix matching, so we store
+				// just the base filename (e.g. "Notepad.exe").
+				targetName = extractProcessRuleName(pathStr)
+				if targetName == "" {
+					re.Logger.Errf("Empty process rule name for path %s, skipping", pathStr)
+					continue
+				}
 			}
 
-			req, err := buildRuleRequest(ruleTypeProcess, matchPath, action, 0, ntPath)
+			req, err := buildRuleRequest(rType, mType, action, 0, targetName)
 			if err != nil {
-				re.Logger.Errf("Failed to build rule request for %s: %v", pp.Path, err)
+				re.Logger.Errf("Failed to build rule request for %s: %v", pathStr, err)
 				continue
 			}
 
 			if err := sendIoctl(re.deviceHandle, ioctlAddRule, req); err != nil {
-				re.Logger.Errf("Failed to send process rule for %s: %v", pp.Path, err)
+				re.Logger.Errf("Failed to send process rule for %s: %v", pathStr, err)
 				continue
 			}
 
-			processRuleCount++
+			if rType == ruleTypeFile {
+				re.Logger.Printf("Process rule (Script/DLL fallback) sent as File rule: %s -> %s (action=%d)", pathStr, targetName, action)
+				fileRuleCount++
+			} else {
+				re.Logger.Printf("Process rule sent: %s -> %s (action=%d)", pathStr, targetName, action)
+				processRuleCount++
+			}
 		}
 	}
 
-	re.Logger.Printf("Policy update complete: %d file rules, %d process rules sent to driver",
-		fileRuleCount, processRuleCount)
+	re.Logger.Printf("Policy update complete: %d file rules, %d directory rules, %d process rules sent to driver",
+		fileRuleCount, dirRuleCount, processRuleCount)
 }
 
 // resolveAction determines the effective action for a rule.
@@ -199,11 +295,42 @@ func resolveAction(ruleAction string, defaultAction int16) int16 {
 	return defaultAction
 }
 
+// extractProcessRuleName extracts the matching key to store in the driver for
+// a process rule. The driver uses suffix matching, so we store just the
+// filename (e.g. "Notepad.exe") when no directory separator is present,
+// or the full Win32 path normalized with backslashes when a full path is given.
+// This way "Notepad.exe" matches any install location (System32, WindowsApps…).
+func extractProcessRuleName(policyPath string) string {
+	// Normalize slashes
+	p := strings.ReplaceAll(policyPath, "/", "\\")
+	// If no backslash in the path, treat it as a bare filename
+	if !strings.Contains(p, "\\") {
+		return p
+	}
+	// If it's a full path, use just the base name so suffix matching works
+	// regardless of the install directory (handles UWP / WindowsApps).
+	return filepath.Base(p)
+}
+
 // DestroyRuntimeEnforcer Function
 func (re *RuntimeEnforcerImpl) DestroyRuntimeEnforcer() error {
 	// skip if runtime enforcer is not active
 	if re == nil {
 		return nil
+	}
+
+	// Stop the AppLocker poller first
+	if re.appLockerPoller != nil {
+		re.appLockerPoller.Stop()
+		re.Logger.Printf("AppLocker event-log poller stopped")
+	}
+
+	// Remove any AppLocker policies that KubeArmor applied so enforcement
+	// does not persist after KubeArmor exits.
+	if err := clearAppLockerPolicy(); err != nil {
+		re.Logger.Warnf("Failed to clear AppLocker policy on shutdown: %v", err)
+	} else {
+		re.Logger.Printf("AppLocker policy cleared (NotConfigured)")
 	}
 
 	if re.deviceHandle != 0 && re.deviceHandle != windows.InvalidHandle {

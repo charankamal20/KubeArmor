@@ -1194,7 +1194,8 @@ func (s *FilterService) processMessage(msg *tp.Log) error {
 	switch msg.Type {
 	case "HostLog":
 		s.Logger.PushLog(*msg)
-	case "MatchHostPolicy":
+	case "MatchedHostPolicy":
+		// Blocked event — route as an alert via the feeder pipeline
 		s.Logger.PushLog(*msg)
 	default:
 		s.Logger.Warnf("unknown log type: %q", msg.Type)
@@ -1291,7 +1292,8 @@ func getLogType(tp uint32) string {
 	case 1:
 		return "HostLog"
 	case 2:
-		return "MatchHostPolicy"
+		// Must match feeder.PushLog routing: "MatchedHostPolicy" → Alert
+		return "MatchedHostPolicy"
 	default:
 		return "INVALID_LOG_TYPE"
 	}
@@ -1361,7 +1363,7 @@ func getElevationType(et uint32) string {
 }
 
 func handleFileEvent(buf []byte, log_ *tp.Log) {
-	if len(buf) < 41 {
+	if len(buf) < 53 {
 		return
 	}
 	log_.Operation = "File"
@@ -1379,11 +1381,14 @@ func handleFileEvent(buf []byte, log_ *tp.Log) {
 
 	fileOp := binary.LittleEndian.Uint32(buf[17:21])
 	log_.PID = int32(binary.LittleEndian.Uint32(buf[21:25]))
+	log_.PPID = int32(binary.LittleEndian.Uint32(buf[25:29]))
 
-	pPathOff := binary.LittleEndian.Uint32(buf[25:29])
-	pPathLen := binary.LittleEndian.Uint32(buf[29:33])
-	fPathOff := binary.LittleEndian.Uint32(buf[33:37])
-	fPathLen := binary.LittleEndian.Uint32(buf[37:41])
+	pPathOff := binary.LittleEndian.Uint32(buf[29:33])
+	pPathLen := binary.LittleEndian.Uint32(buf[33:37])
+	fPathOff := binary.LittleEndian.Uint32(buf[37:41])
+	fPathLen := binary.LittleEndian.Uint32(buf[41:45])
+	ppPathOff := binary.LittleEndian.Uint32(buf[45:49])
+	ppPathLen := binary.LittleEndian.Uint32(buf[49:53])
 
 	if pPathOff > 0 && pPathLen > 0 && int(pPathOff+pPathLen) <= len(buf) {
 		pPathBytes := buf[pPathOff : pPathOff+pPathLen]
@@ -1403,6 +1408,15 @@ func handleFileEvent(buf []byte, log_ *tp.Log) {
 		log_.Resource = windows.UTF16ToString(u16Str)
 	}
 
+	if ppPathOff > 0 && ppPathLen > 0 && int(ppPathOff+ppPathLen) <= len(buf) {
+		ppPathBytes := buf[ppPathOff : ppPathOff+ppPathLen]
+		u16Str := make([]uint16, ppPathLen/2)
+		for i := range u16Str {
+			u16Str[i] = binary.LittleEndian.Uint16(ppPathBytes[i*2:])
+		}
+		log_.ParentProcessName = windows.UTF16ToString(u16Str)
+	}
+
 	log_.Data = "Event=" + getFileOperation(fileOp)
 }
 
@@ -1410,9 +1424,20 @@ func handleProcessEvent(buf []byte, log_ *tp.Log) {
 	if len(buf) < 53 {
 		return
 	}
-	log_.Type = "HostLog"
-	log_.Operation = "Process"
+
+	// Parse EVENT header (packed layout, from EventStructs.h):
+	//   buf[0:8]   = timestamp (ULONGLONG)
+	//   buf[8:12]  = type (FS_EVENT_TYPE: 1=HostLog, 2=MatchHostPolicy)
+	//   buf[12:16] = operation (FS_EVENT_OPERATION: 1=Process)
+	//   buf[16]    = blocked (BOOLEAN)
+	//   buf[17+]   = PROCESS_EVENT union
 	log_.Timestamp = int64(binary.LittleEndian.Uint64(buf[0:8]))
+	evType := binary.LittleEndian.Uint32(buf[8:12])
+	// buf[12:16] is operation — always Process here, skip
+	blocked := buf[16] != 0
+
+	log_.Operation = "Process"
+	log_.Enforcer = "Minifilter"
 
 	procOp := binary.LittleEndian.Uint32(buf[17:21])
 	log_.PID = int32(binary.LittleEndian.Uint32(buf[21:25]))
@@ -1432,6 +1457,7 @@ func handleProcessEvent(buf []byte, log_ *tp.Log) {
 			u16Str[i] = binary.LittleEndian.Uint16(pPathBytes[i*2:])
 		}
 		log_.ProcessName = windows.UTF16ToString(u16Str)
+		log_.Resource = log_.ProcessName
 	}
 
 	if cmdOff > 0 && cmdLen > 0 && int(cmdOff+cmdLen) <= len(buf) {
@@ -1456,6 +1482,19 @@ func handleProcessEvent(buf []byte, log_ *tp.Log) {
 		log_.Data = "Event=Create"
 	} else {
 		log_.Data = "Event=Terminate"
+	}
+
+	// Route as a policy-match alert when the driver blocked the process,
+	// otherwise emit a plain telemetry log.
+	if evType == 2 || blocked {
+		log_.Type = "MatchedHostPolicy"
+		log_.Action = "Block"
+		log_.Result = "Permission denied"
+		log_.PolicyName = "KubeArmor-Process-Block"
+	} else {
+		log_.Type = "HostLog"
+		log_.Action = "Audit"
+		log_.Result = "Passed"
 	}
 }
 
