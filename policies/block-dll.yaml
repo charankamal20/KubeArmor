@@ -5,9 +5,9 @@ metadata:
 spec:
   nodeSelector:
     matchLabels:
-      kubernetes.io/hostname: "test"
+      kubearmor.io/hostname: "*"
   process:
     matchPaths:
-    - path: C:\Windows\System32\malicious.dll
-    - path: bad.ocx
+    - path: C:\Users\test\driver\test-files\malicious.dll
+    - path: C:\Users\test\driver\test-files\bad.ocx
   action: Block

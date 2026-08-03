@@ -27,7 +27,7 @@ import (
 //   8003 = EXE allowed in enforce mode (allowed by rule)  -- NOT a block
 //   8004 = EXE BLOCKED in enforce mode  ← the one we want
 // In "Microsoft-Windows-AppLocker/MSI and Script":
-//   8008 = Script blocked
+//   8007 = Script blocked
 // In "Microsoft-Windows-AppLocker/Packaged app-Execution":
 //   8022 = Packaged app blocked
 //
@@ -255,17 +255,15 @@ type appLockerEvent struct {
 	eventID     uint16
 }
 
-// blockEventXPath returns an XPath expression that selects block events newer
-// than afterRecordID from the given channel.
 func blockEventXPath(channel string, afterRecordID uint64) string {
 	// Block event IDs differ per channel:
 	//   EXE and DLL:          8004
-	//   MSI and Script:       8008
+	//   MSI and Script:       8007 (8008 is SKU not supported)
 	//   Packaged app-Exec:    8022
 	var ids string
 	switch channel {
 	case appLockerMsiScriptChannel:
-		ids = "EventID=8008"
+		ids = "EventID=8007"
 	case appLockerPackagedChannel:
 		// 8022 = specific app blocked, 8027 = ALL apps blocked (due to missing rules)
 		ids = "(EventID=8022 or EventID=8027)"

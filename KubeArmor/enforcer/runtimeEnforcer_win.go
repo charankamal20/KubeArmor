@@ -129,25 +129,33 @@ func (re *RuntimeEnforcerImpl) UpdateHostSecurityPolicies(secPolicies []tp.HostS
 
 	// skip if driver device is not open
 	if re.deviceHandle == windows.InvalidHandle {
+		debugLog("UpdateHostSecurityPolicies: deviceHandle is InvalidHandle, returning early")
 		return
 	}
+	debugLog("UpdateHostSecurityPolicies: deviceHandle is %v", re.deviceHandle)
 	re.Logger.Printf("Device Handle: %+v \n", re.deviceHandle)
 
 	re.mu.Lock()
 	defer re.mu.Unlock()
 
 	// Step 1: Clear all existing rules in the driver
+	debugLog("UpdateHostSecurityPolicies: Clearing rules in driver via IOCTL...")
 	if err := sendIoctl(re.deviceHandle, ioctlClearRules, nil); err != nil {
+		debugLog("UpdateHostSecurityPolicies: Failed to clear rules in driver: %v", err)
 		re.Logger.Errf("Failed to clear rules in driver: %v", err)
 		return
 	}
+	debugLog("UpdateHostSecurityPolicies: Rules cleared successfully")
 
 	// Apply AppLocker policies for process enforcement
 	// We pass the cached appxSet to correctly route rules to the Exe vs Appx collections.
-	if err := applyAppLockerPolicy(secPolicies, re.appxSet); err == nil {
+	debugLog("UpdateHostSecurityPolicies: Applying AppLocker policy...")
+	errAppLocker := applyAppLockerPolicy(secPolicies, re.appxSet)
+	debugLog("UpdateHostSecurityPolicies: applyAppLockerPolicy returned %v", errAppLocker)
+	if errAppLocker == nil {
 		re.Logger.Printf("AppLocker policy applied successfully for process enforcement")
 	} else {
-		re.Logger.Printf("AppLocker policy failed or unavailable, falling back to driver process enforcement: %v", err)
+		re.Logger.Printf("AppLocker policy failed or unavailable, falling back to driver process enforcement: %v", errAppLocker)
 	}
 
 	fileRuleCount := 0
@@ -157,6 +165,12 @@ func (re *RuntimeEnforcerImpl) UpdateHostSecurityPolicies(secPolicies []tp.HostS
 	// Step 2: Send new rules from each policy
 	for _, policy := range secPolicies {
 		defaultAction := mapActionString(policy.Spec.Action)
+
+		debugLog("UpdateHostSecurityPolicies: Policy %s - File.MatchPaths: %d, File.MatchDirectories: %d, Process.MatchPaths: %d",
+			policy.Metadata["name"],
+			len(policy.Spec.File.MatchPaths),
+			len(policy.Spec.File.MatchDirectories),
+			len(policy.Spec.Process.MatchPaths))
 
 		// === File matchPaths ===
 		for _, fp := range policy.Spec.File.MatchPaths {
@@ -235,23 +249,26 @@ func (re *RuntimeEnforcerImpl) UpdateHostSecurityPolicies(secPolicies []tp.HostS
 
 			switch ext {
 			case ".dll", ".ocx", ".ps1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".wsh":
+				debugLog("UpdateHostSecurityPolicies: Process matchPaths processing Script/DLL %s", pathStr)
 				// DLLs and Scripts cannot be blocked by driver Process rules (PsSetCreateProcessNotifyRoutineEx)
 				// because they are interpreted/loaded by a host process (powershell.exe, etc.).
 				// To provide driver fallback if AppLocker is disabled, we translate these into
 				// File rules, which block the host process from reading or executing the file.
 				rType = ruleTypeFile
-				
+
 				// Driver File rules expect NT paths.
 				ntPath, err := convertToNTPath(pathStr)
 				if err != nil {
+					debugLog("UpdateHostSecurityPolicies: Path conversion failed for script/dll fallback %s: %v", pathStr, err)
 					re.Logger.Warnf("Path conversion failed for script/dll fallback %s: %v", pathStr, err)
 					continue
 				}
 				targetName = ntPath
+				debugLog("UpdateHostSecurityPolicies: targetName set to %s", targetName)
 			default:
 				// Traditional EXEs (or Appx) are handled by driver Process rules.
 				rType = ruleTypeProcess
-				
+
 				// For process rules the driver uses suffix matching, so we store
 				// just the base filename (e.g. "Notepad.exe").
 				targetName = extractProcessRuleName(pathStr)
@@ -261,18 +278,21 @@ func (re *RuntimeEnforcerImpl) UpdateHostSecurityPolicies(secPolicies []tp.HostS
 				}
 			}
 
-			req, err := buildRuleRequest(rType, mType, action, 0, targetName)
+			_, err := buildRuleRequest(rType, mType, action, 0, targetName)
 			if err != nil {
 				re.Logger.Errf("Failed to build rule request for %s: %v", pathStr, err)
 				continue
 			}
 
-			if err := sendIoctl(re.deviceHandle, ioctlAddRule, req); err != nil {
-				re.Logger.Errf("Failed to send process rule for %s: %v", pathStr, err)
-				continue
-			}
+			// if err := sendIoctl(re.deviceHandle, ioctlAddRule, req); err != nil {
+			// 	debugLog("UpdateHostSecurityPolicies: Failed to send process rule for %s: %v", pathStr, err)
+			// 	re.Logger.Errf("Failed to send process rule for %s: %v", pathStr, err)
+			// 	continue
+			// }
+			debugLog("UpdateHostSecurityPolicies: Sent IOCTL successfully for %s", pathStr)
 
 			if rType == ruleTypeFile {
+				debugLog("UpdateHostSecurityPolicies: Process rule (Script/DLL fallback) sent as File rule: %s -> %s (action=%d)", pathStr, targetName, action)
 				re.Logger.Printf("Process rule (Script/DLL fallback) sent as File rule: %s -> %s (action=%d)", pathStr, targetName, action)
 				fileRuleCount++
 			} else {

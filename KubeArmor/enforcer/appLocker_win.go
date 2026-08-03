@@ -26,28 +26,16 @@ import (
 const appLockerTemplate = `
 <AppLockerPolicy Version="1">
   <RuleCollection Type="Exe" EnforcementMode="Enabled">
-    <FilePathRule Id="fd686d83-a829-4351-8ff4-27c7de5755d2" Name="(Default Rule) All files located in the Program Files folder" Description="Allows members of the Everyone group to run applications that are located in the Program Files folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%PROGRAMFILES%%\*" />
-      </Conditions>
+    <FilePathRule Id="fd686d83-a829-4351-8ff4-27c7de5755d2" Name="KubeArmor Default Allow All (Everyone)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-1-0" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
-    <FilePathRule Id="9428c734-6101-41fb-9a1b-3ef1a69a4897" Name="(Default Rule) All files located in the Windows folder" Description="Allows members of the Everyone group to run applications that are located in the Windows folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%WINDIR%%\*" />
-      </Conditions>
-    </FilePathRule>
-    <FilePathRule Id="a61c8b2c-a319-4cd0-9690-d2177cad7b51" Name="(Default Rule) All files" Description="Allows members of the local Administrators group to run all applications." UserOrGroupSid="S-1-5-32-544" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="*" />
-      </Conditions>
+    <FilePathRule Id="fd686d83-a829-4351-8ff4-27c7de5755d3" Name="KubeArmor Default Allow All (AppPackages)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-15-2-1" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
 	%s
   </RuleCollection>
   <RuleCollection Type="Appx" EnforcementMode="Enabled">
-    <FilePublisherRule Id="a9e18c21-ff8f-43cf-b9fc-db40eed693ba"
-      Name="(Default Rule) All signed packaged apps"
-      Description="Allows members of the Everyone group to run all signed packaged apps. Required to prevent Windows from blanket-blocking the Start Menu, Store, and all UWP apps when Exe enforcement is active."
-      UserOrGroupSid="S-1-1-0" Action="Allow">
+    <FilePublisherRule Id="a9e18c21-ff8f-43cf-b9fc-db40eed693ba" Name="KubeArmor Default Allow All Appx" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-1-0" Action="Allow">
       <Conditions>
         <FilePublisherCondition PublisherName="*" ProductName="*" BinaryName="*">
           <BinaryVersionRange LowSection="0.0.0.0" HighSection="*" />
@@ -57,56 +45,29 @@ const appLockerTemplate = `
 	%s
   </RuleCollection>
   <RuleCollection Type="Dll" EnforcementMode="Enabled">
-    <FilePathRule Id="b882379b-2eeb-4375-9762-b92476b77259" Name="(Default Rule) All files located in the Program Files folder" Description="Allows members of the Everyone group to run applications that are located in the Program Files folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%PROGRAMFILES%%\*" />
-      </Conditions>
+    <FilePathRule Id="b882379b-2eeb-4375-9762-b92476b77259" Name="KubeArmor Default Allow All (Everyone)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-1-0" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
-    <FilePathRule Id="0dcad6b8-4796-4876-b33c-3965b6f3c11d" Name="(Default Rule) All files located in the Windows folder" Description="Allows members of the Everyone group to run applications that are located in the Windows folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%WINDIR%%\*" />
-      </Conditions>
-    </FilePathRule>
-    <FilePathRule Id="186a8c43-9828-44bd-926c-dcc5bd18bde8" Name="(Default Rule) All files" Description="Allows members of the local Administrators group to run all applications." UserOrGroupSid="S-1-5-32-544" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="*" />
-      </Conditions>
+    <FilePathRule Id="b882379b-2eeb-4375-9762-b92476b7725a" Name="KubeArmor Default Allow All (AppPackages)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-15-2-1" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
 	%s
   </RuleCollection>
   <RuleCollection Type="Script" EnforcementMode="Enabled">
-    <FilePathRule Id="12e5c850-205b-42fa-b4c6-e7e8b67272dc" Name="(Default Rule) All files located in the Program Files folder" Description="Allows members of the Everyone group to run applications that are located in the Program Files folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%PROGRAMFILES%%\*" />
-      </Conditions>
+    <FilePathRule Id="12e5c850-205b-42fa-b4c6-e7e8b67272dc" Name="KubeArmor Default Allow All (Everyone)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-1-0" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
-    <FilePathRule Id="40bd42eb-3fb1-4389-9e8d-806733ec5af8" Name="(Default Rule) All files located in the Windows folder" Description="Allows members of the Everyone group to run applications that are located in the Windows folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%WINDIR%%\*" />
-      </Conditions>
-    </FilePathRule>
-    <FilePathRule Id="39563266-9b16-43d9-a0ef-5cb4cf3966fa" Name="(Default Rule) All files" Description="Allows members of the local Administrators group to run all applications." UserOrGroupSid="S-1-5-32-544" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="*" />
-      </Conditions>
+    <FilePathRule Id="12e5c850-205b-42fa-b4c6-e7e8b67272dd" Name="KubeArmor Default Allow All (AppPackages)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-15-2-1" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
 	%s
   </RuleCollection>
   <RuleCollection Type="Msi" EnforcementMode="Enabled">
-    <FilePathRule Id="19ae66bf-e9db-484c-8f9d-16a7396644eb" Name="(Default Rule) All files located in the Program Files folder" Description="Allows members of the Everyone group to run applications that are located in the Program Files folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%PROGRAMFILES%%\*" />
-      </Conditions>
+    <FilePathRule Id="19ae66bf-e9db-484c-8f9d-16a7396644eb" Name="KubeArmor Default Allow All (Everyone)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-1-0" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
-    <FilePathRule Id="3c24b614-74ea-4c46-99cc-6e6b541aedbd" Name="(Default Rule) All files located in the Windows folder" Description="Allows members of the Everyone group to run applications that are located in the Windows folder." UserOrGroupSid="S-1-1-0" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="%%WINDIR%%\*" />
-      </Conditions>
-    </FilePathRule>
-    <FilePathRule Id="551db8f8-b114-419b-b0b8-466d1f05e3ec" Name="(Default Rule) All files" Description="Allows members of the local Administrators group to run all applications." UserOrGroupSid="S-1-5-32-544" Action="Allow">
-      <Conditions>
-        <FilePathCondition Path="*" />
-      </Conditions>
+    <FilePathRule Id="19ae66bf-e9db-484c-8f9d-16a7396644ec" Name="KubeArmor Default Allow All (AppPackages)" Description="KubeArmor Default Allow" UserOrGroupSid="S-1-15-2-1" Action="Allow">
+      <Conditions><FilePathCondition Path="*" /></Conditions>
     </FilePathRule>
 	%s
   </RuleCollection>

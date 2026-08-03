@@ -5,9 +5,9 @@ metadata:
 spec:
   nodeSelector:
     matchLabels:
-      kubernetes.io/hostname: "test"
+      kubearmor.io/hostname: "*"
   process:
     matchPaths:
-    - path: C:\malicious.ps1
-    - path: malicious.bat
+    - path: D:\KubeArmor\policies\test-files\malicious.ps1
+    - path: D:\KubeArmor\policies\test-files\malicious.bat
   action: Block
