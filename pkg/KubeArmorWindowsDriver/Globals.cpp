@@ -143,6 +143,9 @@ NTSTATUS Globals::Init() {
 VOID Globals::DestroyRuleHashTable() {
     // Acquire lock so any concurrent LookupRule / InsertRule that squeezed
     // in before FltUnregisterFilter returned will finish before we free.
+    // ExAcquireFastMutex requires IRQL <= APC_LEVEL; assert here so any
+    // future caller that violates this is caught immediately in debug builds.
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_Lock);
     DestroyHashTable(m_Table);
     m_Table = NULL;
@@ -150,6 +153,7 @@ VOID Globals::DestroyRuleHashTable() {
 
 
 BOOLEAN Globals::InsertRule(_In_ PUNICODE_STRING Path, _In_ RuleAction Action) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_Lock);
     PRULE_ENTRY entry = AllocateRuleEntry(Path, Action, RULE_TYPE_PROCESS, MATCH_PATH, 0);
     if (!entry) 
@@ -167,6 +171,7 @@ BOOLEAN Globals::InsertRule(_In_ PUNICODE_STRING Path, _In_ RuleAction Action) {
 }
 
 PRULE_ENTRY Globals::LookupRule(_In_ PUNICODE_STRING Path) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_Lock);  // hold lock for entire lookup
     return LookupRuleBySuffix(m_Table, Path);
 }
@@ -176,6 +181,7 @@ PRULE_ENTRY Globals::LookupRule(_In_ PUNICODE_STRING Path) {
 // Holds m_Lock for the entire lookup so the entry cannot be freed
 // concurrently by ClearAllRules.
 RuleAction Globals::LookupRuleAction(_In_ PUNICODE_STRING Path) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_Lock);
     PRULE_ENTRY entry = LookupRuleBySuffix(m_Table, Path);
     if (entry == nullptr)
@@ -184,6 +190,7 @@ RuleAction Globals::LookupRuleAction(_In_ PUNICODE_STRING Path) {
 }
 
 BOOLEAN Globals::RemoveRule(_In_ PUNICODE_STRING Path) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> lock(m_Lock);
     PRULE_ENTRY rule = LookupRuleInTable(m_Table, Path);
     if (!rule) 
@@ -208,6 +215,7 @@ BOOLEAN Globals::InsertFileRule(
     _In_ MATCH_TYPE MatchType,
     _In_ USHORT Flags)
 {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_FileRuleLock);
 
     // For directory rules, ensure the path ends with a backslash
@@ -240,6 +248,7 @@ BOOLEAN Globals::InsertFileRule(
 }
 
 PRULE_ENTRY Globals::LookupFileRule(_In_ PUNICODE_STRING Path) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_FileRuleLock);
 
     // Phase 1: Exact-path hash lookup (fast path for MATCH_PATH rules)
@@ -316,6 +325,7 @@ PRULE_ENTRY Globals::LookupFileRule(_In_ PUNICODE_STRING Path) {
 }
 
 BOOLEAN Globals::RemoveFileRule(_In_ PUNICODE_STRING Path) {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_FileRuleLock);
     PRULE_ENTRY rule = LookupRuleInTable(m_FileRuleTable, Path);
     if (!rule)
@@ -326,6 +336,7 @@ BOOLEAN Globals::RemoveFileRule(_In_ PUNICODE_STRING Path) {
 }
 
 VOID Globals::ClearAllFileRules() {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_FileRuleLock);
     ClearHashTable(m_FileRuleTable);
 }
@@ -333,6 +344,7 @@ VOID Globals::ClearAllFileRules() {
 VOID Globals::DestroyFileRuleHashTable() {
     // Acquire lock so any concurrent LookupFileRule / InsertFileRule that
     // squeezed in before FltUnregisterFilter returned will finish first.
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     Locker<FastMutex> locker(m_FileRuleLock);
     DestroyHashTable(m_FileRuleTable);
     m_FileRuleTable = NULL;
@@ -343,6 +355,7 @@ VOID Globals::DestroyFileRuleHashTable() {
 // ============================
 
 VOID Globals::ClearAllRules() {
+    NT_ASSERT(KeGetCurrentIrql() <= APC_LEVEL);
     {
         Locker<FastMutex> locker(m_Lock);
         ClearHashTable(m_Table);
