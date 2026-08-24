@@ -271,14 +271,34 @@ PRULE_ENTRY Globals::LookupFileRule(_In_ PUNICODE_STRING Path) {
 
     if (Path->Length > 0) {
         USHORT totalChars = Path->Length / sizeof(WCHAR);
-        WCHAR  prefixBuf[MAX_PATH_LENGTH / sizeof(WCHAR)];
+
+        // prefixBuf holds incrementally-built directory prefixes that are hashed
+        // and probed against stored directory rules.  Rules are inserted via IOCTL
+        // with paths capped at MAX_PATH_LENGTH WCHARs, so any prefix longer than
+        // that can never match a stored rule — stop accumulating as soon as the
+        // buffer is full.
+        //
+        // Without this guard a normalized NT path longer than MAX_PATH_LENGTH/2
+        // chars (common for UWP / long-user-profile paths on Windows 11) writes
+        // past the end of the stack array, clobbers the /GS cookie, and causes
+        // KERNEL_SECURITY_CHECK_FAILURE (0x139).
+        constexpr USHORT kPrefixBufChars =
+            static_cast<USHORT>(MAX_PATH_LENGTH / sizeof(WCHAR));
+
+        WCHAR  prefixBuf[kPrefixBufChars];
         USHORT prefixChars = 0;
 
         for (USHORT i = 0; i < totalChars; i++) {
+            // Stop building prefixes once the buffer is full.  Any directory rule
+            // in the driver is shorter than MAX_PATH_LENGTH (enforced by the IOCTL
+            // handler), so no prefix at or beyond this length can ever match.
+            if (prefixChars >= kPrefixBufChars)
+                break;
+
             prefixBuf[prefixChars++] = Path->Buffer[i];
 
             if (Path->Buffer[i] == L'\\') {
-                // prefixBuf[0..prefixChars-1] is a '\'-terminated prefix.
+                // prefixBuf[0..prefixChars-1] is a '\\'-terminated prefix.
                 UNICODE_STRING prefix;
                 prefix.Buffer        = prefixBuf;
                 prefix.Length        = prefixChars * sizeof(WCHAR);
