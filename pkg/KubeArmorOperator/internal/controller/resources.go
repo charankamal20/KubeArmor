@@ -403,14 +403,6 @@ func deploySnitch(nodename string, runtime string) *batchv1.Job {
 								Name:      "seccomp-path",
 								MountPath: "/var/lib/kubelet/seccomp",
 							},
-							{
-								Name:      "hook-dir",
-								MountPath: "/usr/share/containers/oci/hooks.d",
-							},
-							{
-								Name:      "kubearmor-dir",
-								MountPath: "/usr/share/kubearmor",
-							},
 						},
 						SecurityContext: &corev1.SecurityContext{
 							RunAsUser:  &rootUser,
@@ -480,24 +472,6 @@ func deploySnitch(nodename string, runtime string) *batchv1.Job {
 						VolumeSource: corev1.VolumeSource{
 							HostPath: &corev1.HostPathVolumeSource{
 								Path: "/var/lib/kubelet/seccomp",
-								Type: &common.HostPathDirectoryOrCreate,
-							},
-						},
-					},
-					{
-						Name: "hook-dir",
-						VolumeSource: corev1.VolumeSource{
-							HostPath: &corev1.HostPathVolumeSource{
-								Path: "/usr/share/containers/oci/hooks.d",
-								Type: &common.HostPathDirectoryOrCreate,
-							},
-						},
-					},
-					{
-						Name: "kubearmor-dir",
-						VolumeSource: corev1.VolumeSource{
-							HostPath: &corev1.HostPathVolumeSource{
-								Path: "/usr/share/kubearmor",
 								Type: &common.HostPathDirectoryOrCreate,
 							},
 						},
